@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="./image/Logo.png" alt="OPD Learning Lab" width="360" />
+  <img src="./image/Logo.png" alt="OPD Learning Lab" width="350" />
 </p>
 
-<h1 align="center">OPD Learning Lab</h1>
+<h2 align="center">OPD Learning Lab</h2>
 
 <p align="center">
   <a href="https://fumadocs.dev/"><img src="https://img.shields.io/badge/Fumadocs-16.11-5b6cf0?logo=fumadocs&logoColor=white" alt="Fumadocs" /></a>
