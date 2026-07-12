@@ -30,6 +30,14 @@
 
 > 部署在 [blog.palind-rome.top/opd-learning-lab](https://blog.palind-rome.top/opd-learning-lab/)
 
+<p align="center">
+  <img width="700" alt="image" src="https://github.com/user-attachments/assets/88e51dd6-bab8-4f78-913d-dc1e9f538bd5" />
+</p>
+
+## 动机
+
+<img width="431" height="287" alt="image" src="https://github.com/user-attachments/assets/f7eff269-6b95-46a1-a4e4-d5d5d32bc7db" />
+
 ## 课程结构
 
 ```
