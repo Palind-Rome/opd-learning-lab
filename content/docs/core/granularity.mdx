@@ -1,0 +1,358 @@
+---
+title: 监督粒度：sampled、full-vocabulary 与 top-k
+description: 同一前缀上，教师究竟返回一个 token、整个词表还是一个截断支持集？逐项比较目标、偏差、方差与系统成本。
+---
+
+“我们用了 reverse-KL OPD”仍然少了一个关键信息：**每个前缀上到底比较了多少个 token？**
+
+固定学生前缀 $s_t$，记学生分布为 $p_t$、教师分布为 $q_t$。完整条件 reverse KL 是：
+
+$$
+K_t
+=D_{\mathrm{KL}}(p_t\|q_t)
+=\sum_{v\in V}p_t(v)
+\log\frac{p_t(v)}{q_t(v)}.
+$$
+
+sampled、full-vocabulary 和 top-k 主要在 **vocabulary 维度** 做不同取舍。它们不改变前缀应来自学生这一 on-policy 条件，也不会自动解决长时域信用分配。
+
+## 先看结论
+
+| 粒度 | 每个前缀需要的教师信息 | 对完整条件 RKL 的关系 | 主要优势 | 主要代价 |
+|---|---|---|---|---|
+| sampled token | 学生采到 token 的一个 log-prob | 在正确采样条件下，log-ratio 是 KL **值**的单样本无偏估计 | 通信和存储最小，容易接到 RL pipeline | 方差大；梯度需 policy-gradient surrogate |
+| full vocabulary | 整个词表 logits / log-probs | 对该固定前缀精确 | 密集、低方差，可直接反传条件 KL | 约 $O(BTM)$ 的张量/通信压力 |
+| top-k subset | 一个选定集合上的概率 | 通常是截断、重归一化后的近似目标 | 保留多 token 信号，成本介于两者之间 | 集合规则和尾部处理会引入偏差，`top-k` 名字不够描述算法 |
+
+这里 $B$ 是 batch size，$T$ 是有效 response 长度，$M=|V|$ 是词表大小。[Rethinking OPD §2.2](https://arxiv.org/pdf/2604.13016) 也用这三类粒度建立统一比较。
+
+## 1. Sampled-token：只询问学生真正选中的 token
+
+学生从当前分布采样：
+
+$$
+y_t\sim p_t.
+$$
+
+教师只需返回 $q_t(y_t)$，构造：
+
+$$
+\widehat K_t
+=\log p_t(y_t)-\log q_t(y_t).
+$$
+
+因为
+
+$$
+\mathbb E_{y_t\sim p_t}[\widehat K_t]
+=K_t,
+$$
+
+所以它是固定前缀上条件 KL **数值**的单样本无偏估计。
+
+### 为什么它便宜
+
+传回 learner 的教师信息从每位置 $M$ 个数降到 1 个数：
+
+```text
+student token ids:       [B, T]
+student sampled logp:    [B, T]
+teacher sampled logp:    [B, T]
+response mask:           [B, T]
+```
+
+教师内部仍要做 forward pass 和 softmax / log-sum-exp 才能得到规范化 log-prob，但不必跨 worker 保存或传输 $[B,T,M]$ 的完整张量。
+
+### 它何时不再是“原分布 RKL 的无偏样本”
+
+- token 从温度分布 $p^{(\tau)}$ 采样，分子却写原始 $p$；
+- rollout 使用 top-p / top-k 截断，训练解释却仍写未截断 $p$；
+- sampler 是旧策略 $b$，却没有说明 importance correction；
+- teacher 与 student 的 token / chat template / right shift 没对齐；
+- 为控制方差裁剪 log-ratio 或 advantage。
+
+这些做法不一定错误，但目标或估计器已经改变，不能继续无条件声称“这是完整 $D_{\mathrm{KL}}(p\|q)$ 的无偏估计”。
+
+### 为什么不能只对 `logp - logq` 普通反传
+
+`y_t` 是从依赖学生参数的分布采出来的。常见实现把
+
+$$
+A_t=\operatorname{sg}[\log q_t(y_t)-\log p_{\text{sample},t}(y_t)]
+$$
+
+作为 advantage，再通过 learner log-prob 与 importance ratio 做 policy-gradient 更新。Thinking Machines 的基础 Tinker recipe 就采用这一路径，并明确没有在其实验中使用 top-k logit distillation。[实现说明](https://thinkingmachines.ai/blog/on-policy-distillation/)
+
+<Callout type="info" title="sampled 的准确说法">
+  “单 token log-ratio 是 conditional KL 值的无偏 Monte Carlo 样本；配合正确的 score-function / importance-sampling surrogate，可以估计相应局部 reverse-KL 梯度。”不要简写成“一个 token 就精确等于 KL”。
+</Callout>
+
+## 2. Full-vocabulary：在整个词表上精确求和
+
+每个学生前缀都取得完整 $p_t$ 与 $q_t$：
+
+$$
+K_t
+=\sum_{v\in V}p_t(v)
+\left(\log p_t(v)-\log q_t(v)\right).
+$$
+
+在该前缀被视为固定时，对这个表达式直接反传会得到精确的 conditional RKL 梯度。与单 token 相比，它让教师对每个候选 token 都提供信息，词表维度方差更低。
+
+### 成本从哪里来
+
+若显式保留全部张量，量级是：
+
+$$
+O(BTM).
+$$
+
+举例：$B=64$、$T=4096$、$M=150000$ 时，仅一个 BF16 全词表张量的理论元素存储就约为
+
+$$
+64\times4096\times150000\times2\ \text{bytes}
+\approx 73.2\ \text{GiB}.
+$$
+
+这还没算学生/教师两份 logits、反向激活和并行通信。实际系统会用 sequence chunking、在线规约、词表并行或不落盘的 fused kernel 降低峰值，但无法消除“必须处理大量词表项”的事实。
+
+### Full-vocabulary 仍有边界
+
+- 它精确的是**当前固定前缀上的词表求和**；
+- 它不自动反传穿过离散 rollout 的早期 token；
+- 两模型必须有可比较的 token 事件；
+- teacher logits 精确并不代表 teacher 在陌生学生前缀上可靠；
+- 若只保存 teacher top-k，事后无法重建完整 KL 尾部。
+
+因此 full-vocabulary 是统计与系统取舍，不是成功保证。
+
+## 3. Top-k：先问“谁的 top-k”
+
+`top-k OPD` 不是完整算法名。至少要补全以下问题：
+
+1. 集合由学生、教师、并集还是交集选出？
+2. $k$ 是多少，是否随 token 改变？
+3. 子集内是否重新归一化？
+4. 子集外概率质量如何处理？
+5. top-k 集合选择是否 stop-gradient？
+6. teacher 传的是 logits、log-probs 还是带归一化常数的概率？
+
+### Rethinking OPD 中的 student top-k 定义
+
+论文先选：
+
+$$
+S_t=\operatorname{TopK}(p_t,k).
+$$
+
+然后分别把学生与教师在 $S_t$ 上重归一化：
+
+$$
+\bar p_t^{S_t}(v)
+=\frac{p_t(v)\mathbf 1[v\in S_t]}
+{\sum_{u\in S_t}p_t(u)},
+$$
+
+$$
+\bar q_t^{S_t}(v)
+=\frac{q_t(v)\mathbf 1[v\in S_t]}
+{\sum_{u\in S_t}q_t(u)}.
+$$
+
+目标是子集 KL：
+
+$$
+K_t^{\text{top-k}}
+=D_{\mathrm{KL}}
+(\bar p_t^{S_t}\|\bar q_t^{S_t}).
+$$
+
+它丢弃 $S_t$ 外的质量，因此通常有：
+
+$$
+K_t^{\text{top-k}}
+\ne D_{\mathrm{KL}}(p_t\|q_t).
+$$
+
+top-k 的价值是以显著小于 $M$ 的多 token 支持，换取比 sampled-token 更密集的局部监督；代价是目标偏差取决于被丢弃尾部的质量和教师/学生差异。
+
+## 4. 四种常见集合不是一回事
+
+令
+
+$$
+S_t^p=\operatorname{TopK}(p_t,k),
+\qquad
+S_t^q=\operatorname{TopK}(q_t,k).
+$$
+
+| 集合 | 它强调什么 | 可能漏掉什么 |
+|---|---|---|
+| student top-k $S_t^p$ | 学生当前最可能采取的动作 | 教师高概率但学生尚未重视的 token |
+| teacher top-k $S_t^q$ | 教师认为最值得模仿的局部支持 | 学生高概率但教师 top-k 外的危险动作 |
+| union $S_t^p\cup S_t^q$ | 同时覆盖双方头部 | 集合更大、通信更多 |
+| overlap $S_t^p\cap S_t^q$ | 双方共享的高概率区域 | 尚未共享但可能承载新能力的 token |
+
+还会遇到 asymmetric top-k：例如只让教师发自己的 top-k，然后用近似尾部质量补全；或在 teacher top-k 上做 forward KL。它们的梯度、偏差和通信协议都不同。
+
+<Callout type="warn" title="重归一化会改变相对问题">
+  子集 KL 问的是“已知 token 落在这个集合里，双方如何分配条件概率”；完整 KL 还关心“双方给这个集合总共多少质量”。若只看重归一化分布，可能掩盖教师把极少质量放在整个 student top-k 上的事实。
+</Callout>
+
+## 5. 正确理解论文里的 97–99%
+
+[Rethinking OPD](https://arxiv.org/abs/2604.13016) 在一组具体的成功 OPD 实验中研究：
+
+- student：R1-Distill-1.5B；
+- teacher：JustRL-1.5B；
+- prompts：DAPO-Math-17K；
+- 默认 $k=16$；
+- 比较 Student Top-k、双方 top-k 的 overlap、以及 non-overlap 支持。
+
+论文在该设置中报告：
+
+- top-k overlap ratio 约从 72% 上升到 91% 以上；
+- overlap tokens 在训练中承载学生和教师各自约 97–99% 的概率质量；
+- 只优化 overlap top-k，在三个数学 benchmark 上接近完整 **Student Top-k** 变体；
+- 只优化 non-overlap top-k 明显更弱。
+
+这支持论文对该实验的解释：成功 OPD 的主要优化发生在双方共享的高概率区域，并形成渐进对齐。
+
+### 它没有证明什么
+
+- 没有证明任意模型对、任意领域的 overlap mass 都是 97–99%；
+- 没有证明 $k=16$ 普遍最优；
+- 没有证明 overlap-only 等价于**完整词表** KL；论文对照的是 Student Top-k 变体；
+- 没有证明高 overlap ratio 单独足以保证任务性能；
+- 没有证明应永久丢弃 non-overlap token——新知识恰可能最初位于未共享区域。
+
+尤其要区分两个指标：
+
+$$
+R_t^{\text{overlap}}
+=\frac{|S_t^p\cap S_t^q|}{k}
+$$
+
+只数集合中的 token 个数；而
+
+$$
+M_{p,t}^{\text{overlap}}
+=\sum_{v\in S_t^p\cap S_t^q}p_t(v)
+$$
+
+才衡量学生概率质量。论文附录也指出，只看 overlap-token advantage 可能在 overlap mass 很低时造成误解。
+
+## 6. 一个四 token 玩具例子
+
+假设：
+
+| token | 学生 $p$ | 教师 $q$ |
+|---|---:|---:|
+| A | 0.50 | 0.45 |
+| B | 0.30 | 0.05 |
+| C | 0.15 | 0.45 |
+| D | 0.05 | 0.05 |
+
+取 $k=2$：
+
+- student top-2 是 `{A, B}`；
+- teacher top-2 是 `{A, C}`；
+- overlap 只有 `{A}`。
+
+若只在 student top-2 上重归一化，教师的 C 质量被完全丢掉；若只在 teacher top-2 上重归一化，学生过度偏爱的 B 又被丢掉；若只在 overlap `{A}` 上归一化，双方都变成概率 1，子集 KL 直接等于 0。
+
+这说明“overlap-only 很好”依赖 overlap 已覆盖双方主要概率质量。集合交集大或小，不能代替 mass 检查。
+
+## 7. 选择粒度的工程决策树
+
+### 先用 sampled-token，当你满足：
+
+- teacher API 只能返回指定 token 的 log-prob；
+- 已有 RL rollout + importance-sampling pipeline；
+- 词表极大、序列很长或 teacher/student 分离部署；
+- 可以用更大 batch、优势归一化和监控来承受方差。
+
+### 考虑 full-vocabulary，当你满足：
+
+- teacher 与 student 共址或高带宽；
+- 词表与序列规模可控；
+- 想做低方差基线或核验 sampled/top-k 的估计误差；
+- 可以 chunk / fuse 计算，不必长期保存完整 logits。
+
+### 考虑 top-k，当你满足：
+
+- 想保留多 token 监督，但 full-vocab 通信不可接受；
+- 能明确记录集合来源、$k$、重归一化和尾部策略；
+- 已用 held-out states 比较 top-k 与 full-vocab 的误差；
+- 会同时监控 subset mass，而不是只看集合 overlap。
+
+## 8. 推荐的校准实验
+
+在正式大规模训练前，从同一批冻结的 student states 抽样：
+
+1. 计算 full-vocabulary $K_t$ 作为小规模参考；
+2. 对同一状态重复 sampled-token 多次，估计方差；
+3. 扫描 $k\in\{8,16,32,64,128\}$；
+4. 比较 student / teacher / union top-k；
+5. 记录 retained mass、KL 误差、梯度余弦相似度与通信字节；
+6. 按 token 位置分桶，检查长前缀上的误差是否更大。
+
+不要只比较 training loss。近似目标的数值更小，可能只是因为它丢掉了难学的概率质量。
+
+## 9. 实验记录模板
+
+```text
+vocabulary alignment:        same tokenizer / mapping = ...
+support selector:            student / teacher / union / overlap
+k:                           ...
+renormalize inside subset:   yes / no
+outside mass handling:       discard / residual bucket / approximation
+selector gradient:           stop-gradient / other
+teacher payload:             token ids + logits/logprobs + normalizer
+sampling distribution:       temperature=?, top_p=?, top_k=?
+reference check:             full-vocab on N states
+metrics:                     retained mass, KL error, grad cosine, bytes
+```
+
+## 自测
+
+<details>
+<summary>sampled-token 为什么“无偏”却可能训练得很抖？</summary>
+
+无偏只约束重复采样后的均值；一个 token 的 log-ratio 方差可能很大。有限 batch、稀有高损失 token、策略陈旧和 clipping 都会进一步影响梯度。
+
+</details>
+
+<details>
+<summary>top-k 变大是否保证单调逼近完整 KL？</summary>
+
+当集合最终覆盖全词表时会回到完整 KL，但有限 $k$ 下的重归一化目标不一定以简单、单调的方式逼近；集合成员还会随模型和 $k$ 改变。应在固定 states 上实测误差。
+
+</details>
+
+<details>
+<summary>97–99% 能否直接作为你的 top-k retained-mass 预期？</summary>
+
+不能。那是 Rethinking OPD 在特定成功数学配置中对 overlap tokens 的实验观察。新模型、prompt、训练阶段和长前缀都要重新测量。
+
+</details>
+
+<Cards>
+  <Card title="回到目标推导" href="/docs/core/objective">
+    分清 conditional KL 值、score-function 梯度与时间信用分配。
+  </Card>
+  <Card title="失败时怎么排查" href="/docs/frontier/failure-recipes">
+    从数据对齐、教师可教性、估计器与长轨迹逐层定位。
+  </Card>
+  <Card title="阅读 verl OPD 工程" href="/docs/engineering/verl-architecture">
+    把 teacher payload、rollout 张量和 loss 配置对到分布式代码。
+  </Card>
+</Cards>
+
+## 一手资料
+
+- [Rethinking OPD — §2.2、§4 与 Appendix B](https://arxiv.org/abs/2604.13016)
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [Tinker Cookbook — Distillation](https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation)
+- [Revisiting On-Policy Distillation](https://arxiv.org/abs/2603.25562v2)
+- [verl — OPD documentation](https://verl.readthedocs.io/en/latest/algo/opd.html)

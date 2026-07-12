@@ -1,0 +1,266 @@
+---
+title: 开始前：最小预备知识
+description: 不要求先学完整强化学习；补齐自回归语言模型、概率、KL、采样和 policy-gradient 的最小工具箱即可。
+---
+
+你不需要先成为强化学习专家，也不需要会推 Transformer 的每一层。学习 OPD 前，真正需要的是一套很小但必须准确的工具箱。
+
+<Callout type="info" title="最低入场线">
+  能解释“模型为什么输出 next-token 概率”、看懂 log-prob 与期望、知道 rollout 会改变后续前缀，再补一条 score-function identity，就足以开始核心课程。PPO、分布式训练和完整 KL 推导可以边学边用。
+</Callout>
+
+## 0. 先做一个两分钟诊断
+
+试着回答下面五问：
+
+1. logits 与概率有什么区别？
+2. 为什么一条回答里的第 100 个 token 依赖前 99 个 token？
+3. $D_{\mathrm{KL}}(p\|q)$ 与 $D_{\mathrm{KL}}(q\|p)$ 是否相同？
+4. 从 $p$ 抽一个 token 得到的 log-ratio，为什么不等于完整 KL？
+5. sampler 和 learner 不是同一个 checkpoint 时，为什么会出现 importance ratio？
+
+答不全很正常。本页正好补齐这些概念。
+
+## 1. 自回归语言模型：整条回答是一串条件概率
+
+语言模型把回答的概率分解为：
+
+$$
+\pi_\theta(y\mid x)
+=\prod_{t=1}^{T}\pi_\theta(y_t\mid x,y_{1:t-1}).
+$$
+
+取对数后，乘法变加法：
+
+$$
+\log \pi_\theta(y\mid x)
+=\sum_{t=1}^{T}\log \pi_\theta(y_t\mid x,y_{1:t-1}).
+$$
+
+这两行是 OPD 的地基。它们告诉我们：
+
+- 每个位置都有一个 next-token 分布；
+- 学生选出的 token 会进入下一个位置的条件中；
+- 序列级 log-ratio 可以拆成逐 token log-ratio；
+- EOS 也是 token，决定一条轨迹何时终止。
+
+### 必须分清：prompt token 与 response token
+
+训练通常只在 response 上计算 OPD loss。prompt、padding、某些 chat-template 特殊 token 应由 mask 排除。否则你可能在优化“复述用户问题”或 padding，而不是学生行为。
+
+## 2. logits、softmax、概率与 log-prob
+
+模型在某个前缀上输出词表大小的 logits $z\in\mathbb R^{|V|}$。softmax 把它变成概率：
+
+$$
+p_i=\frac{\exp(z_i)}{\sum_j\exp(z_j)}.
+$$
+
+工程里通常保存 `log_softmax` 的结果，即
+
+$$
+\log p_i=z_i-\log\sum_j\exp(z_j),
+$$
+
+因为它比“先 softmax 再取 log”数值更稳定。
+
+| 量 | 例子 | 用途 |
+|---|---|---|
+| logit | `2.7` | softmax 前的未归一化分数 |
+| probability | `0.42` | 可相加、总和为 1 |
+| log-prob | `log(0.42) ≈ -0.87` | 序列上可直接相加，KL 与 NLL 常用 |
+
+### 温度会改变采样策略
+
+$$
+p_i^{(\tau)}=\frac{\exp(z_i/\tau)}{\sum_j\exp(z_j/\tau)}.
+$$
+
+- $\tau>1$：更平，探索更多；
+- $\tau<1$：更尖，接近 greedy；
+- top-k / top-p 还会进一步截断和重归一化。
+
+因此，“模型原始分布”“实际采样分布”和“训练时计算 log-prob 的分布”可能不是同一个对象。声称 sampled estimator 无偏前，必须说明 token 究竟从哪个分布采样。
+
+## 3. 交叉熵与 KL：都在比较分布，但方向重要
+
+固定一个前缀，令教师为 $q$、学生为 $p_\theta$。
+
+### Forward KL
+
+$$
+D_{\mathrm{KL}}(q\|p_\theta)
+=\sum_a q(a)\log\frac{q(a)}{p_\theta(a)}.
+$$
+
+当教师固定时，最小化它等价于最小化教师 soft targets 对学生的交叉熵。期望权重来自教师，常被称为 mode-covering。
+
+### Reverse KL
+
+$$
+D_{\mathrm{KL}}(p_\theta\|q)
+=\sum_a p_\theta(a)\log\frac{p_\theta(a)}{q(a)}
+=\mathbb E_{a\sim p_\theta}
+\left[\log p_\theta(a)-\log q(a)\right].
+$$
+
+期望权重来自学生，常被称为 mode-seeking。Thinking Machines 的基础 OPD recipe 使用的就是学生采样下的 reverse-KL 信号。
+
+<Callout type="warn" title="KL 非负，不代表单个 token 的 log-ratio 非负">
+  完整期望 $D_{\mathrm{KL}}(p\|q)\ge 0$；但一次采样得到的 $\log p(a)-\log q(a)$ 可以为正也可以为负，有限 batch 均值也可能短暂小于 0。
+</Callout>
+
+## 4. 期望与 Monte Carlo：一个样本不是整个分布
+
+若
+
+$$
+J=\mathbb E_{a\sim p}[f(a)],
+$$
+
+无法枚举词表或所有序列时，可以采样 $a_1,\ldots,a_N\sim p$，用
+
+$$
+\widehat J=\frac1N\sum_{i=1}^{N}f(a_i)
+$$
+
+估计 $J$。
+
+“无偏”只表示重复采样后的平均值等于真值：
+
+$$
+\mathbb E[\widehat J]=J.
+$$
+
+它不表示：
+
+- 每个 batch 都接近真值；
+- 方差很小；
+- 截断 top-k 后仍对原分布无偏；
+- 对估计值直接 `backward()` 就一定得到目标的无偏梯度。
+
+最后一点在 OPD 特别重要：采样动作本身依赖学生参数，必须使用适当的 policy-gradient / score-function 处理，或者计算完整可微分分布损失。
+
+## 5. 把语言模型翻译成最小强化学习词典
+
+| RL 词汇 | OPD 中的含义 |
+|---|---|
+| policy | 学生 next-token 分布 |
+| state | prompt + 当前学生前缀 |
+| action | 下一个 token |
+| trajectory | 一次完整或截断回答 |
+| reward / advantage | 教师 log-ratio 变成的逐 token 更新信号 |
+| behavior policy / sampler | 真正生成这批 token 的模型版本 |
+| learner policy | 正在被梯度更新的模型版本 |
+
+OPD 使用了 RL 的采样与更新语言，但教师分布提供的是密集监督。PPO 是理解 ratio、旧策略和 clipping 的有用背景，却不是 OPD 的定义。
+
+## 6. 只需记住一条 policy-gradient identity
+
+对 $a\sim p_\theta$：
+
+$$
+\nabla_\theta\mathbb E_{a\sim p_\theta}[f(a)]
+=\mathbb E_{a\sim p_\theta}
+\left[f(a)\nabla_\theta\log p_\theta(a)\right]
+$$
+
+适用于 $f$ 不显式依赖 $\theta$ 的基本情形。更一般时还要加上 $f$ 自身的导数。
+
+另一个常用事实是：
+
+$$
+\mathbb E_{a\sim p_\theta}
+[\nabla_\theta\log p_\theta(a)]=0.
+$$
+
+因此，给 advantage 减去与动作无关的 baseline，不改变期望梯度，却可能降低方差。reverse-KL 梯度里出现的常数 $+1$ 也可以靠这个恒等式消去。
+
+你暂时不需要背 REINFORCE 的所有证明，但要知道：**采样 token 上的标量应作为停止梯度的权重，乘在 learner 的 log-prob 或 importance-sampling surrogate 上；不能只对缓存的旧 log-prob 求导。**
+
+## 7. 为什么会有两个 ratio
+
+OPD 实现里常同时出现两种比值：
+
+### 教师监督 log-ratio
+
+$$
+r_t^{\text{teach}}
+=\log p_{\text{sample}}(y_t\mid s_t)
+-\log q_T(y_t\mid s_t).
+$$
+
+它衡量教师与采样学生对同一个 token 的相对偏好，用来构造 reverse-KL signal。
+
+### learner / sampler importance ratio
+
+$$
+\rho_t
+=\frac{p_{\text{learner}}(y_t\mid s_t)}
+{p_{\text{sample}}(y_t\mid s_t)}.
+$$
+
+它修正“生成数据的模型版本”和“正在更新的模型版本”之间的差异。两者名字都带 ratio，却解决完全不同的问题。
+
+## 8. 工程最低要求：会检查形状、位移与 mask
+
+源码阅读时至少能追踪这些张量：
+
+```text
+input_ids:            [batch, sequence]
+student_logits:       [batch, sequence, vocab]
+teacher_logits:       [batch, sequence, vocab]   # full-vocab 情形
+sampled_logprobs:     [batch, response_length]
+teacher_logprobs:     [batch, response_length]   # sampled-token 情形
+response_mask:        [batch, response_length]
+advantages:           [batch, response_length]
+```
+
+预测 token $y_t$ 的 logits 通常位于输入序列的前一个位置，所以 labels 与 logits 会有 right shift。最常见的静默错误包括：
+
+- teacher 与 student chat template 不同；
+- response 起点错一位；
+- 把 prompt 或 padding 算进 loss；
+- EOS 后仍继续累计；
+- tokenizers 不同却按 token id 直接对齐；
+- sampler 用温度分布采样，advantage 却混用原始分布 log-prob。
+
+## 9. 哪些可以以后再学
+
+| 现在必须会 | 进入工程章节再补 | 前沿研究时再补 |
+|---|---|---|
+| 自回归分解、softmax、log-prob | 分布式 actor/rollout/teacher 拓扑 | trust region 的更严谨推导 |
+| forward / reverse KL 的方向 | FSDP、张量并行、通信压缩 | 长时域 credit assignment |
+| 期望、采样、无偏与方差 | 异步策略陈旧与 importance sampling | 跨 tokenizer 分布映射 |
+| state/action/trajectory | PPO mini-batch 与 clipping | off-policy correction 的稳定性理论 |
+| shift、mask、EOS | teacher top-k 传输格式 | 目标重构与熵感知方法 |
+
+## 10. 推荐学习顺序
+
+1. 本页把符号读顺；
+2. 读[为什么要 On-Policy](/docs/foundations/why-on-policy)，理解状态分布；
+3. 读[KL：目标与估计器](/docs/foundations/kl-divergence)，完成公式推导；
+4. 读[核心目标](/docs/core/objective)，把序列目标与工程更新对上；
+5. 读[sampled / full / top-k](/docs/core/granularity)，选择监督接口；
+6. 再进入 Tinker 与 verl 源码，不要一上来就陷入分布式配置。
+
+## 自测答案
+
+<details>
+<summary>展开开头的五问</summary>
+
+1. logits 是未归一化分数；softmax 后才是总和为 1 的概率。
+2. 自回归条件是 $(x,y_{1:t-1})$，每个已生成 token 都进入下一步状态。
+3. 不相同；KL 不对称，两个方向的期望权重也不同。
+4. 单 token log-ratio 是完整期望的一个随机样本；它可能正、负或偏离均值很远。
+5. 数据来自 sampler，而梯度作用于 learner；importance ratio 用来修正动作概率的版本差异。
+
+</details>
+
+## 一手资料
+
+- [GKD / On-Policy Distillation of Language Models](https://arxiv.org/abs/2306.13649)
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [PPO](https://arxiv.org/abs/1707.06347)
+- [Tinker Cookbook — Distillation recipes](https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation)
+- [verl — OPD documentation](https://verl.readthedocs.io/en/latest/algo/opd.html)

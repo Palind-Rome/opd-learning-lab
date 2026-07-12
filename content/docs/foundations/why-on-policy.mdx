@@ -1,0 +1,210 @@
+---
+title: 为什么要 On-Policy？
+description: 从状态分布、暴露偏差和错误恢复出发，理解 OPD 为什么让学生在自己的轨迹上学习。
+---
+
+<Callout type="info" title="这一章只回答一个问题">
+  为什么不能一直拿教师写好的答案训练学生，而要让学生先自己作答？读完后，你应该能区分“谁生成训练轨迹”和“用什么 KL 训练”这两个独立选择。
+</Callout>
+
+假设你在教一个刚学会下棋的学生：
+
+- **只看大师棋谱**：每一步都很强，但学生实战时走错一步，棋盘就变成棋谱里从未出现过的局面；
+- **只看最后输赢**：学生经历了自己的真实局面，却不知道究竟哪一步走坏了；
+- **点评学生自己的每一步**：老师在学生真正遇到的局面上给出密集反馈。
+
+第三种方式，就是 On-Policy Distillation（OPD）的核心直觉。
+
+## 先把语言模型翻译成“策略”
+
+对一条自回归生成序列：
+
+$$
+y_1,y_2,\ldots,y_T,
+$$
+
+在第 $t$ 步可以这样理解：
+
+| 强化学习语言 | 语言模型里的含义 |
+|---|---|
+| state $s_t$ | prompt 与已经生成的前缀 $(x,y_{<t})$ |
+| action $a_t$ | 下一个 token $y_t$ |
+| policy $\pi_\theta$ | 学生模型的 next-token 分布 |
+| trajectory / rollout | 一条完整或截断的 completion |
+
+学生选择的 token 会进入下一步前缀。因此，一个早期 token 不只影响当前一步，还会改变以后访问到的所有 state。
+
+## Off-policy 训练看见了谁的前缀？
+
+典型的离线蒸馏或 SFT 流程是：
+
+```text
+prompt ──> 教师生成答案 ──> 固定成训练集 ──> 学生做交叉熵训练
+```
+
+假设教师轨迹是：
+
+```text
+A → B → C → 正确答案
+```
+
+学生训练时反复见到 `A`、`A B`、`A B C` 这些教师前缀。但部署时，它可能生成：
+
+```text
+A → X → ?
+```
+
+到了前缀 `A X`，学生进入了教师数据没有覆盖的 state。后面的预测又依赖这个错误前缀，于是偏差可能逐步累积。这就是自回归模型中的 **train–inference distribution mismatch**；常见表现是 **exposure bias**。
+
+GKD 论文把这个问题与 imitation learning 联系起来：固定数据训练只覆盖数据分布中的部分序列，而部署时学生面对的是自己诱导出的前缀分布。[GKD §3.1](https://arxiv.org/pdf/2306.13649)
+
+<Callout type="warn" title="Off-policy 并不等于不好">
+  教师轨迹通常质量高、训练稳定，而且可以把学生原本几乎不会生成的新知识与新格式“放进有效 support”。问题在于：只做 off-policy 训练，学生很少练习如何从自己的错误前缀恢复。
+</Callout>
+
+## 用状态分布写清楚
+
+令 $d_{\text{data}}(s)$ 表示固定数据中的前缀分布，$d_{\pi_\theta}(s)$ 表示当前学生 rollout 产生的前缀分布。
+
+固定数据训练近似优化：
+
+$$
+\mathbb E_{s\sim d_{\text{data}}}\left[\mathcal L(s)\right],
+$$
+
+而 on-policy 训练把监督放到：
+
+$$
+\mathbb E_{s\sim d_{\pi_\theta}}\left[\mathcal L(s)\right].
+$$
+
+部署时真正遇到的是 $d_{\pi_\theta}$。因此，on-policy 的价值不是一句模糊的“数据更新鲜”，而是让训练 state 更接近学生实际生成时的 state。
+
+## OPD 的一轮在做什么？
+
+```text
+1. 从当前学生保存一个 sampler
+2. 学生在 prompts 上生成 rollouts
+3. 固定教师在这些学生前缀上计算 next-token log-prob
+4. 把教师与学生的差异变成逐 token 训练信号
+5. 更新学生，再用新学生采下一轮
+```
+
+关键是第 2 步：**轨迹来自学生，不来自教师**。教师不替学生重写答案，而是在学生已经走到的前缀上提供反馈。
+
+Thinking Machines 将三种方法概括为：
+
+| 方法 | rollout 来自谁 | 监督密度 | 学到错误恢复？ |
+|---|---|---:|---:|
+| SFT / 离线蒸馏 | 固定数据或教师 | token 级，密集 | 较弱 |
+| On-policy RL | 学生 | 常为序列级，稀疏 | 是 |
+| OPD | 学生 | token 级，密集 | 是 |
+
+来源：[Thinking Machines Lab, *On-Policy Distillation*](https://thinkingmachines.ai/blog/on-policy-distillation/)。
+
+## 为什么 OPD 比只看最终奖励更“会教”
+
+假设一个数学回答有 2,000 个 token，最终答案错了。
+
+- 结果奖励可能只给整条轨迹一个 `0`；
+- OPD 可以在每个前缀比较学生与教师的 next-token 倾向。
+
+因此，学生不必等整条 rollout 结束才收到信号，也可以从截断轨迹学习。博文展示的例子中，教师对把推理带向错误分支的 token 罚得更重；当最后答案已被错误前缀完全决定时，最后几个 token 反而未必有最大差异。[博文 Illustration](https://thinkingmachines.ai/blog/on-policy-distillation/)
+
+这也解释了为什么 OPD 常被描述为兼具：
+
+- RL 的 **on-policy relevance**；
+- 蒸馏的 **dense supervision**。
+
+## On-policy 与 Reverse KL 不是同义词
+
+这是一条必须记住的分界：
+
+- **on/off-policy**：决定训练前缀由谁产生；
+- **forward/reverse KL/JSD**：决定在一个已经给定的前缀上，如何比较教师和学生分布。
+
+GKD 的 Algorithm 1 同时提供两个旋钮：
+
+- $\lambda$：学生生成数据所占比例；
+- $D$：forward KL、reverse KL 或 generalized JSD。
+
+所以完全可以有 `on-policy + forward KL`。Thinking Machines 的基础 Tinker recipe 选择了 `on-policy + reverse-KL 的采样估计`，但这只是 OPD 的一个具体实例。
+
+<Cards>
+  <Card title="下一步：KL 到底往哪个方向？" href="/docs/foundations/kl-divergence">
+    分清 forward KL、reverse KL、JSD，以及“目标”和“估计器”。
+  </Card>
+  <Card title="看真实训练循环" href="/docs/engineering/tinker-cookbook">
+    沿着 Tinker 源码走完 rollout、教师打分、advantage 与更新。
+  </Card>
+</Cards>
+
+## 为什么还要先做 SFT？
+
+纯 on-policy reverse-KL 只能高频学习学生能够采到的行为。虽然 softmax 通常给每个 token 非零概率，但一个知识点、工具格式或推理策略可能低到几乎不会被采样——这就是工程上的“有效 support 不足”。
+
+因此常见配方是：
+
+```text
+预训练学生
+  ↓
+SFT / off-policy distillation：加入领域知识与基本行为
+  ↓
+OPD：在学生自己的状态分布上纠错并贴近教师
+```
+
+GKD 的实验从已经 SFT、能生成足够质量输出的学生开始；Thinking Machines 的 reasoning 实验也先在 OpenThoughts3 上做 off-policy SFT，再在 DeepMath prompts 上做 OPD。[GKD §3.1 Remark](https://arxiv.org/pdf/2306.13649)；[Tinker Model Distillation recipe](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/)。
+
+<Callout type="info" title="一个实用判断">
+  如果学生“知道该领域，却总在自己的推理路径上走偏”，OPD 很合适；如果学生连相关概念、token 模式或工具语法都几乎生成不出来，应先补数据、SFT 或 mid-training。
+</Callout>
+
+## On-policy 仍然有代价和边界
+
+### 需要持续采样
+
+每轮都要用学生生成新轨迹，并让教师对这些轨迹做 forward pass。与重复训练一份固定数据相比，这增加了在线生成和教师打分成本。
+
+### 教师错误会被继承
+
+低 teacher KL 只意味着学生贴近教师，并不保证教师对真实世界正确。教师若在某类问题上系统性出错，OPD 也会传递这种偏差。
+
+### 容量差距仍然存在
+
+小学生未必有容量覆盖教师的完整分布。GKD 因此研究了 mode-covering 的 forward KL、mode-seeking 的 reverse KL 和两者之间的 JSD；最佳选择与任务有关。
+
+### “更 on-policy”不等于“更会探索”
+
+on-policy 只说明从当前学生采样。学生若分布已经过尖，仍可能反复访问很窄的状态集合；rollout temperature、prompt 多样性、batch size 和初始化都会影响覆盖范围。
+
+## 在 Tinker 源码中找到这些概念
+
+当前固定提交 `b939b4f3c14502e84c60e05e560ef93b9da31baf` 中：
+
+- `PromptOnlyEnv.step()` 始终返回环境 reward `0.0`：[`datasets.py` L85–121](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/datasets.py#L85-L121)；
+- 学生按 `temperature` 和 `max_tokens` 生成 rollout：[`train_on_policy.py` L321–338](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L321-L338)；
+- 每轮训练后返回带最新权重的新 sampling client：[`train_on_policy.py` L345–357](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L345-L357)；
+- 教师只负责 `compute_logprobs`，不参与反向传播：[`train_on_policy.py` L443–472](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L443-L472)。
+
+## 自测
+
+1. 学生在教师轨迹前缀上把 next-token loss 降得很低，为什么部署时仍可能崩？
+2. `on-policy + forward KL` 是否自相矛盾？
+3. 学生从未采到某种工具调用格式时，纯采样 reverse-KL OPD 能否可靠地教会它？
+
+<details>
+<summary>查看答案</summary>
+
+1. 部署时学生可能因早期误差进入训练未覆盖的前缀，产生状态分布错配和误差累积。
+2. 不矛盾。on-policy 描述前缀来源，forward KL 描述固定前缀上的分布差异。
+3. 通常不能可靠做到；应先用 SFT、领域数据或其他探索手段把该行为放进学生的有效 support。
+
+</details>
+
+## 一手资料
+
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [Agarwal et al. — On-Policy Distillation of Language Models / GKD](https://arxiv.org/abs/2306.13649)
+- [GKD ICLR 2024 PDF](https://arxiv.org/pdf/2306.13649)
+- [Tinker Cookbook — Model Distillation](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/)
+

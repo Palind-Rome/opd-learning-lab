@@ -1,0 +1,247 @@
+---
+title: 2026 方法对照：它们究竟改了 OPD 的哪一步
+description: 用同一套坐标比较 Revisiting OPD、G-OPD、Entropy-Aware、SCOPE、Rethinking、IW-OPD、OPSD、AOPD、Prune-OPD、Veto、TrOPD 与机制研究。
+---
+
+2026 年的 OPD 论文看起来像一串相似缩写，实际却在处理不同问题。有的改教师目标，有的筛 token，有的缩短 rollout，有的改变 advantage，还有的根本不是训练算法，而是失败诊断或研究议程。
+
+这页不按“谁分数最高”排序，而是问一个更实用的问题：**相对 vanilla OPD，它动了哪一根旋钮？**
+
+<Callout title="先纠正四个容易粘连的名字">
+  `G-OPD / ExOPD` 是同一篇论文里的通用框架与 reward extrapolation 特例；`Veto / Adaptive Target Reformulation` 是方法名与论文机制，不是两篇论文；`AOPD` 的 A 是 Asymmetric；用户材料里的 `TrOPDGKD` 应拆成 2026 年的 TrOPD 和 2023 年的 GKD。
+</Callout>
+
+## 共同基线：vanilla OPD 做了什么
+
+给定问题 $x$，学生先生成 $y \sim \pi_\theta(\cdot\mid x)$。在第 $t$ 个学生前缀 $s_t=(x,y_{<t})$ 上，教师给出下一 token 分布 $\pi_T(\cdot\mid s_t)$。常见 sampled-token 实现使用
+
+$$
+a_t = \log \pi_T(y_t\mid s_t)-\log \pi_\theta(y_t\mid s_t)
+$$
+
+作为停止梯度的稠密信号，再更新学生采样 token 的 log-prob。另一类实现直接计算全词表 KL、top-k KL 或 JSD。它们都可能被口头称为“reverse-KL OPD”，但**目标散度、采样估计器和梯度并不自动相同**。
+
+用下面六根坐标轴，可以放下这一页的所有方法：
+
+| 轴 | vanilla 选择 | 2026 工作常改什么 |
+|---|---|---|
+| 状态来源 | 当前学生完整 rollout | 冷启动、teacher prefix、轨迹修订、动态截断 |
+| 教师来源 | 独立强教师 | 同模型 + 特权信息、多教师、灵活 reference |
+| 支持集 | 单采样 token 或全词表 | teacher top-k、可靠区域、高熵 token、特殊 token mask |
+| 目标/散度 | 固定 RKL/FKL/JSD | 中间目标、按熵切换、按 advantage 符号分支 |
+| 信用分配 | token 等权、即时 log-ratio | 按位置、累计漂移、轨迹质量、正确性与 PPL 加权 |
+| 系统预算 | 完整 rollout + 每步 teacher forward | 提前终止、局部窗口、稀疏 token、缓存/压缩传输 |
+
+## 证据与代码状态怎么读
+
+- **E3**：arXiv/官方报告与作者或机构源码仓库都可核验，仓库中能看到训练入口或核心实现；不代表本站已经复现论文数字。
+- **E2**：论文与方法描述可由 arXiv 核验，但本次没有核验到官方源码。
+- **E1**：只有项目页、模型页或报告级说明，只能支持有限结论。
+
+“未核验到代码”是截至 2026-07-13 的保守审计结果，不等于以后不会发布，也不等于网上绝对没有非官方复现。
+
+## 一张表看清 13 个重点条目
+
+| 方法 | 最新核验版本 | 主要改动轴 | 相对 vanilla OPD 的变化 | 官方实现 | 证据 |
+|---|---|---|---|---|---|
+| [Revisiting OPD](https://arxiv.org/abs/2603.25562v2) | v2，2026-04-27 | 支持集、采样、mask | teacher top-k 局部支持 + top-p rollout + 特殊 token 处理 | [有](https://github.com/hhh675597/revisiting_opd) | E3 |
+| [G-OPD / ExOPD](https://arxiv.org/abs/2602.12125) | v2，2026-02-26 | reward、reference | 解耦 reward scale 与 KL reference；scale 大于 1 称 ExOPD | [有](https://github.com/RUCBM/G-OPD) | E3 |
+| [Entropy-Aware OPD](https://arxiv.org/abs/2603.07079) | v3，2026-06-12 | 散度、token 路由 | 教师高熵处加入 FKL，低熵处保留 RKL | 未核验到 | E2 |
+| [SCOPE](https://arxiv.org/abs/2604.10688) | v2，2026-05-30 | correctness 路由、权重 | 错误轨迹做 teacher-PPL 加权 KL；正确轨迹做 student-PPL 加权 MLE | [有](https://github.com/machine981/SCOPE) | E3 |
+| [Rethinking OPD](https://arxiv.org/abs/2604.13016) | v2，2026-04-15 | 初始化、prompt、机制 | off-policy cold start + teacher-aligned prompt selection；先满足可教性条件 | [有](https://github.com/thunlp/OPD) | E3 |
+| [IW-OPD](https://arxiv.org/abs/2606.22600) | v3，2026-06-26 | 位置、信用分配 | 权重随累计 teacher–student discrepancy 调整，通常前高后低 | 未核验到 | E2 |
+| [OPSD](https://arxiv.org/abs/2601.18734) | v3，2026-03-20 | 教师来源、上下文 | 同一模型在 privileged context 下作教师 | [有](https://github.com/siyan-zhao/OPSD) | E3 |
+| [AOPD](https://arxiv.org/abs/2605.06387) | v3，2026-05-13 | advantage 符号、目标 | 正 advantage 做强化；非正区域改做局部散度最小化 | 未核验到 | E2 |
+| [Prune-OPD](https://arxiv.org/abs/2605.07804) | v3，2026-06-01 | 轨迹长度、可靠性 | 监控局部兼容性，漂移后降权并动态截断 | 未核验到 | E2 |
+| [Many Faces](https://arxiv.org/abs/2605.11182) | v2，2026-05-24 | 诊断 | 分析分布失配、biased top-k 与 OPSD 的 PI-free policy 限制 | 未核验到 | E2，非 trainer |
+| [Veto](https://arxiv.org/abs/2601.07155) | v2，2026-04-20 | 目标分布 | 在 student 与 teacher 之间构造几何中间目标 | 未核验到 | E2 |
+| [TrOPD](https://arxiv.org/abs/2606.01249) | v3，2026-06-17 | trust region、outlier | 可靠区做 OPD；异常区 clipping/mask/FKL；加入 teacher-prefix guidance | 未核验到 | E2 |
+| [Formula-Driven Survey](https://arxiv.org/abs/2606.22793) | v1，2026-06-22 | 统一分析框架 | 区分 temporal credit 与 vocabulary routing；提出 GAE-OPD、CR-OPD 议程 | 不适用 | E2，综述/议程 |
+
+## 第一组：教师在学生状态上真的可靠吗
+
+<Tabs items={['Rethinking', 'Revisiting', '长轨迹', 'Many Faces']}>
+  <Tab value="Rethinking">
+
+### Rethinking OPD：先判断“能不能教”，再调 loss
+
+[Rethinking On-Policy Distillation](https://arxiv.org/abs/2604.13016) 把成功条件归纳为两点：学生与教师应有兼容的 thinking pattern；教师还必须提供学生训练中没有见过的新能力。论文观察到，成功对齐主要发生在学生访问状态上的一小组高概率共享 token。
+
+它给出的两个修复不是新奇散度：
+
+1. **off-policy cold start**：先用较容易的教师轨迹把学生带进可教区域；
+2. **teacher-aligned prompt selection**：选择教师确有优势、且学生状态仍能被教师解释的问题。
+
+这篇论文适合在任何 OPD 实验之前读，因为如果 teacher/student 根本不兼容，继续调 KL 系数往往是在修错问题。
+
+**不能过度推断：**“同家族大模型一定适合当教师”并不成立；论文正是用一些 same-family 设置展示教师从学生视角可能没有可辨识新信息。
+
+  </Tab>
+  <Tab value="Revisiting">
+
+### Revisiting OPD：局部支持和实现细节会决定训练是否稳定
+
+[Revisiting OPD](https://arxiv.org/abs/2603.25562v2) 指出 sampled-token OPD 的三类脆弱点：单 token 信号不平衡、教师在学生偏离前缀上不可靠、tokenizer 或特殊 token 不匹配。它提出：
+
+- 在教师 top-k 支持集上比较局部分布；
+- 用 top-p 生成学生 rollout；
+- 对聊天模板和特殊 token 做显式 mask；
+- 不把一个采样 token 的 log-ratio 当成唯一监督来源。
+
+[官方仓库](https://github.com/hhh675597/revisiting_opd) 基于 verl，给出 Teacher-TopK、原始 OPD、数学与 ALFWorld 多任务脚本，适合做“论文公式—配置项—实际 tensor”对照。
+
+**不能过度推断：**top-k 不是免费的通信压缩。选择支持集、是否重新归一化、梯度是否穿过 top-k 构造，都会改变估计器。
+
+  </Tab>
+  <Tab value="长轨迹">
+
+### Prune-OPD、IW-OPD 与 TrOPD：三种不同的长链处理方式
+
+- [IW-OPD](https://arxiv.org/abs/2606.22600) 从**位置偏差**出发，让 token 权重依赖此前累计的 teacher–student discrepancy。作者实验中，前段监督明显比后段有效。
+- [Prune-OPD](https://arxiv.org/abs/2605.07804) 从**算力与可靠性联动**出发，用 top-k overlap 等信号检测 prefix drift，漂移后逐步降权并停止无效生成。
+- [TrOPD](https://arxiv.org/abs/2606.01249) 从**可靠区域**出发，只在 trust region 内做主要 OPD；对 outlier 尝试 clipping、mask 或 FKL，并从 teacher prefix 提供 off-policy guidance。
+
+它们不是同一个“截短 trick”：IW-OPD 改 loss 权重，Prune-OPD 同时改 loss 与 rollout 预算，TrOPD 还改变数据来源和异常区估计器。
+
+**不能过度推断：**IW-OPD 报告的“前 30% 接近全长”是特定实验观察，不是可以写死在所有任务里的比例；Prune-OPD 也会在兼容性高时保留长窗口，而非一律早停。
+
+  </Tab>
+  <Tab value="Many Faces">
+
+### The Many Faces of OPD：它是一张故障诊断表
+
+[The Many Faces of On-Policy Distillation](https://arxiv.org/abs/2605.11182) 报告三类机制：
+
+1. student-generated prefix 使 teacher 与 student 的条件分布错位；
+2. biased TopK reverse-KL 梯度带来优化不稳定；
+3. OPSD 在 instance-specific privileged information 上只能学到一个不含 PI 的聚合策略。
+
+论文考察 stop-gradient TopK、RLVR-adapted teacher 和 SFT-stabilized student 等缓解方式。它的价值是告诉你**先查哪一种故障**，而不是提供一个名为 `ManyFacesTrainer` 的统一替代物。
+
+**不能过度推断：**论文对 OPSD 的负结果限定在其测试设置；共享 system rule 或稳定偏好与每题独有答案是不同的 PI 类型。
+
+  </Tab>
+</Tabs>
+
+## 第二组：教师分布应该怎样进入更新
+
+<Tabs items={['Veto', 'Entropy-Aware', 'AOPD', 'G-OPD']}>
+  <Tab value="Veto">
+
+### Veto：不要让新手一步跳到专家分布
+
+[Stable On-Policy Distillation through Adaptive Target Reformulation](https://arxiv.org/abs/2601.07155) 在学生与教师 logits 之间构造几何中间目标。参数 $\beta$ 一方面压制低置信 token 上可能有害的梯度，另一方面调节输出的果断程度。
+
+它针对的是“大分布间隙”：直接 FKL 可能产生病态梯度，直接 RKL 又可能过度 mode-seeking。Veto 改的是**目标分布本身**，而不是先筛掉一批 rollout。
+
+论文页标注被 ACL 2026 Findings 接收；截至本次核验，arXiv 页面没有给出官方代码链接。
+
+  </Tab>
+  <Tab value="Entropy-Aware">
+
+### Entropy-Aware OPD：教师不确定时，不要逼学生只押一个模式
+
+[Entropy-Aware OPD](https://arxiv.org/abs/2603.07079) 的核心不是在整次实验中二选一，而是使用**教师 token 熵**做局部判断：
+
+- 教师低熵：RKL 的 mode-seeking 更像明确示范；
+- 教师高熵：加入 FKL，覆盖多个教师认为合理的 token，避免多样性过快塌缩。
+
+用户材料指向 v1；截至 2026-07-13，arXiv 已更新到 v3，并标注 ICML 2026。没有核验到作者官方仓库。
+
+  </Tab>
+  <Tab value="AOPD">
+
+### AOPD：正反馈与负反馈不必镜像处理
+
+[Asymmetric On-Policy Distillation](https://arxiv.org/abs/2605.06387) 认为标准 advantage-weighted 更新有高方差、零 advantage 区域梯度消失和探索不足等结构问题。它保留正 advantage 区域的正向强化，却把非正区域替换成 localized divergence minimization。
+
+直觉上，教师明确支持某个学生动作时可以强化；教师不支持时，与其盲目把采样动作往下压，不如把局部分布拉向可解释的教师目标。
+
+**命名提醒：**AOPD 的 A 是 Asymmetric，不是 Veto 论文里的 Adaptive。arXiv 页面未链接官方代码。
+
+  </Tab>
+  <Tab value="G-OPD">
+
+### G-OPD / ExOPD：把 OPD 写成可调的 KL-constrained RL
+
+[G-OPD](https://arxiv.org/abs/2602.12125) 将标准 OPD 解释为 reward 与 KL 正则固定同权的特殊情形，并引入：
+
+- 可替换的 reference model；
+- 独立 reward scale；
+- 当 scale 大于 1 时的 reward extrapolation，即 ExOPD；
+- 强到弱设置中可选 teacher pre-RL base 进行 reward correction。
+
+[官方仓库](https://github.com/RUCBM/G-OPD) 公开了基于 verl 0.6.1 的训练、评测和多教师示例。
+
+**不能过度推断：**“learning beyond teacher” 是论文在特定数学、代码和领域专家合并设置中的结果。增大 reward scale 也可能放大教师错误，不能当成无条件超越教师的按钮。
+
+  </Tab>
+</Tabs>
+
+## 第三组：先路由样本，或换一个教师
+
+### SCOPE：正确轨迹和错误轨迹走两条路
+
+[SCOPE](https://arxiv.org/abs/2604.10688) 先用 verifier 把学生 rollout 分为正确与错误：
+
+- **错误轨迹**：做 teacher-perplexity-weighted KL。教师对该轨迹越有真正的纠错能力，权重越高；
+- **正确轨迹**：做 student-perplexity-weighted MLE。学生已经很自信的答案无需反复强化，低置信正确样本更接近能力边界；
+- 两条路径都做 group-level normalization，以适应不同 prompt 的难度差异。
+
+这不是把一个标量 reward 简单乘在 KL 上，而是改变了目标路由。[官方仓库](https://github.com/machine981/SCOPE) 包含 verl fork、recipe、数据与运行脚本。
+
+### OPSD：教师不是更大，而是知道得更多
+
+[Self-Distilled Reasoner](https://arxiv.org/abs/2601.18734) 让同一模型在两种上下文中扮演 student 与 teacher。teacher 额外看到 verified reasoning trace，student 只看问题，然后在 student rollout 上做 token distribution matching。
+
+[官方代码](https://github.com/siyan-zhao/OPSD) 基于 TRL GOLD，包含 `opsd_trainer.py`、训练脚本和评测。仓库后续还加入逐 token KL clipping，以避免风格 token 主导信号。
+
+最关键的边界是：OPSD 能否成功取决于 privileged information 是否可以被无特权策略内化。它不是“没有教师所以零成本”；同模型 teacher 仍需要额外前向、上下文和可靠 PI。
+
+### Formula-Driven Survey：分析工具，不是又一个 SOTA trainer
+
+[A Formula-Driven Survey and Research Agenda for OPD](https://arxiv.org/abs/2606.22793) 把方法按 feedback-to-update 分成直接分布损失与 policy-gradient log-ratio 更新，并强调两个常被混淆的问题：
+
+- **temporal credit**：当前 token 的 teacher–student log-ratio 应如何影响未来/过去动作；
+- **vocabulary routing**：压低某个采样 token 后，概率质量究竟应该流向哪些 teacher-supported、student-reachable token。
+
+论文提出 GAE-OPD 和 CR-OPD 作为研究方向。它们应标为**假设/议程**，不能和有完整实验验证的算法放在同一“已证实提升”列表中。
+
+## 该选哪一类：从故障现象反推
+
+| 你看到的现象 | 先检查 | 优先阅读 | 不要立刻做什么 |
+|---|---|---|---|
+| loss 正常但能力不涨 | teacher 是否真的有新能力、prompt 是否可教 | Rethinking OPD | 只继续增大学习率或 KL 系数 |
+| 少数 token 的 KL 极大 | 特殊 token、tokenizer、局部支持 | Revisiting OPD、OPSD repo 的 clipping 更新 | 无条件裁掉所有高损失 token |
+| 输出越来越单一 | 教师高熵位置、RKL mode-seeking | Entropy-Aware、Veto | 把 entropy 下降一概当作性能提升 |
+| 长回答后半段几乎没信号 | prefix drift、位置偏差 | IW-OPD、Prune-OPD、TrOPD | 固定复制论文中的 30% 截断比例 |
+| 正确样本被反复强化、错误样本教师也不会教 | correctness 与 PPL 路由 | SCOPE | 对所有 rollout 使用同一个权重 |
+| 没有独立教师 | 是否有可用且可内化的 privileged context | OPSD、Many Faces | 把 ground-truth answer 泄漏当作推理能力 |
+| 想合并多个 RL 专家 | reference 与 reward scaling | G-OPD/ExOPD | 认为 reward scale 越大越好 |
+| sampled-token 更新方差很高 | 目标散度与实际 estimator 是否一致 | Revisiting、OPD+、Formula Survey | 用“我们优化 RKL”掩盖 estimator 细节 |
+
+## 做实验前的最小审计表
+
+在运行任何 2026 方法之前，把下面信息写进实验记录：
+
+1. student rollout 来自哪个 checkpoint？采样温度、top-p、最大长度是什么？
+2. teacher 看见的上下文是否与 student 完全相同？若不同，多了什么 PI？
+3. 计算的是 full-vocabulary KL、top-k KL，还是 sampled-token log-ratio？梯度在哪些量上 stop？
+4. response mask 是否排除了 prompt、padding、工具 token 和特殊 token？
+5. teacher/student tokenizer 是否相同？不同的话如何对齐？
+6. token、segment、turn、trajectory 四种归一化中用了哪一种？
+7. 代码仓库对应论文哪个 commit 和 arXiv 版本？
+8. 论文数字是 Avg@k、Pass@k 还是单次 greedy accuracy？预算是否相同？
+
+只要这八项没有对齐，两个都叫“OPD”的实验也可能完全不可比。
+
+## 继续学习
+
+<Cards>
+  <Card title="回到生态全景" href="/docs/frontier/landscape">
+    看这些方法属于哪个教师访问与应用分支。
+  </Card>
+  <Card title="按层级阅读" href="/docs/frontier/reading-list">
+    先读直觉与最小实现，再读失败模式和 2026 前沿。
+  </Card>
+</Cards>

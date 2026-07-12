@@ -1,0 +1,358 @@
+---
+title: OPD 失败诊断与修复配方
+description: loss 会动但能力不涨、熵塌缩、长轨迹后段失真时，按数据、教师、支持集、目标与系统五层排查。
+---
+
+OPD 失败时，最昂贵的反应是立刻换一个更复杂的新 loss。先判断故障发生在哪一层：数据有没有对齐、教师是否真能教、监督估计是否可信、长前缀是否漂移、系统里的 sampler 与 learner 是否一致。
+
+<Callout type="warn" title="本页的证据读法">
+  2026 年多篇论文给出了有价值的失败现象和修复，但多数结果来自特定数学模型、数据与训练配置。本页会把**通用的检查方法**与**论文特定实验观察**分开写；数字、阈值和比例不能原样当作你的默认超参数。
+</Callout>
+
+## 先看故障分诊表
+
+| 现象 | 第一怀疑对象 | 先做的只读检查 | 可能的下一步 |
+|---|---|---|---|
+| loss / KL 在变，held-out 能力不涨 | 教师没有可迁移新能力，或局部信号不可利用 | teacher/student 独立评测；冻结学生 states 上测 overlap mass、entropy gap、teacher continuation | 换 teacher、做 cold start、改 prompt，而不是只加大学习率 |
+| 开始几步就剧烈抖动 | shift、mask、special token、采样分布或极端 log-ratio | 打印逐 token 对齐；按 token 类型和位置画分布 | 修数据；再考虑 top-k、clip 或稳定化目标 |
+| 输出越来越单一 | RKL mode-seeking、teacher-aligned 数据过窄 | 学生/教师 token entropy、distinct 输出、pass@k | 混合 prompts、熵感知目标或中间 target |
+| 长回答后段 entropy / grad 激增 | prefix drift、教师在深前缀上不可靠 | 按位置分桶画 overlap、KL、entropy、teacher continuation gain | 缩短/课程化 horizon、位置加权、动态截断 |
+| sampled-token 方差大 | 稀有极端 token、batch 太小、策略陈旧 | log-ratio 分位数、ESS、ratio、grad norm | 增 batch、优势归一化、multi-token support |
+| top-k loss 很稳但效果差 | support 选择有偏或丢掉关键尾部 | retained mass、与 full-KL/gradient 的小样本对照 | 改 student/teacher/union support 或增大 $k$ |
+| teacher 明显更强却把学生训差 | thinking pattern 不兼容，或教师局部目标覆盖学生已有好模式 | reverse-distillation / frozen-state 分析；每步 task metric | 停止运行，换更可教 teacher 或桥接初始化 |
+| 训练和复跑结果对不上 | sampler/learner 版本、异步陈旧、配置漂移 | checkpoint id、seed、payload schema、importance ratio | 缩小 policy lag，锁定配置与数据快照 |
+
+## 第 0 层：先排除“根本不是算法问题”
+
+在讨论 thinking pattern 之前，先对一个 16–32 条样本的小 batch 做逐 token 审计。
+
+### 对齐检查
+
+```text
+同一条原始 prompt
+  ├─ student chat template 后的文本 / token ids
+  ├─ teacher 实际读取的文本 / token ids
+  ├─ response 起始位置
+  ├─ 每个 token 的 sampled student logp
+  ├─ 同一 token 事件的 teacher logp
+  └─ loss mask（prompt=0, response=1, pad=0, EOS 后=0）
+```
+
+逐项确认：
+
+- teacher 与 student 读取的是同一个**文本前缀**；
+- 预测 $y_t$ 的 logits 与 label 右移正确；
+- teacher 处于 eval / frozen 状态；
+- padding、prompt 和不应学习的特殊 token 被 mask；
+- EOS 只在有效位置计分，EOS 后没有“幽灵 token”；
+- rollout 的 temperature、top-p、top-k 与记录的 sampler log-prob 一致；
+- learner/sampler 不同版本时，importance ratio 使用正确的分母；
+- tokenizer 不同的模型没有直接按 token id 对齐概率。
+
+[Revisiting OPD](https://arxiv.org/abs/2603.25562v2) 把特殊 token / tokenizer 处理、单 token 信号不平衡和学生偏离前缀上的教师可靠性列为实际脆弱点，并给出 teacher top-k 局部支持、top-p rollout 与显式 mask 等修复。先复现这些基础项，再判断是否需要更前沿的目标。
+
+## 第 1 层：教师“分数更高”不等于“在这里会教”
+
+教师需要同时回答两个问题：
+
+1. **它有没有学生尚未掌握、且任务需要的能力？**
+2. **它在学生访问的前缀上，能否给出方向一致、学生可利用的局部分布？**
+
+只看 teacher benchmark accuracy 不能回答第二问。
+
+### Rethinking OPD 的论文特定观察
+
+[Rethinking OPD](https://arxiv.org/abs/2604.13016) 在数学推理实验中报告：
+
+- 用 Qwen3-1.7B-Base 作学生时，Qwen3-4B-Base-GRPO 教师虽然某些 benchmark 并不更强，却有更高的初始 top-k overlap，蒸馏结果也好于 Qwen3-4B Non-thinking；
+- 在 DeepSeek 与 Qwen 的受控比较中，来自相同 pipeline、只是规模或分数更高的 teacher 带来有限提升；额外 RL post-training 后的 teacher 带来更可迁移的增益；
+- reverse-distillation 实验里，JustRL-1.5B 学生被自己的 pre-RL 1.5B teacher 拉回较弱表现；换成更大的同家族 7B teacher，训练轨迹仍近似地回归，说明 benchmark 更高没有转化成不同的局部 target。
+
+论文据此提出两个经验条件：**thinking-pattern compatibility** 与 **new capability beyond what the student has seen**。
+
+这不是“base 只能配 base”“同家族没有新知识”或“RL teacher 必然更好”的定律。论文全部主实验都在数学 benchmark 上；作者也把代码、开放域和 agent 场景列为待验证方向。
+
+### 你可以怎样测，而不是凭感觉命名 thinking pattern
+
+从冻结学生采一批 states，比较候选教师：
+
+| 指标 | 公式/测试 | 能说明什么 | 不能单独说明什么 |
+|---|---|---|---|
+| top-k overlap ratio | $|S_t^p\cap S_t^q|/k$ | 候选 token 集是否相交 | 交集承载多少概率质量、任务是否变好 |
+| overlap mass | $\sum_{v\in S_t^p\cap S_t^q}p_t(v)$，教师侧也算 | 共享集合是否覆盖双方头部 | 非共享 token 是否含关键新知识 |
+| entropy gap | $|H(p_t)-H(q_t)|$ | 双方局部不确定性是否接近 | 哪一方更正确 |
+| teacher continuation | 从相同学生前缀继续生成并验答案 | 教师在这个深度还能否改进学生 | token 梯度是否方向一致 |
+| reward/正确性 AUROC | 序列均值 log-ratio 能否区分正确 rollout | 全局信号是否有信息 | 局部梯度是否可利用 |
+| gradient norm / cosine | 分 token、位置或 minibatch 比较方向 | 信号是否相互抵消 | 最终泛化性能 |
+
+Rethinking OPD 自己也给出一个重要反例：其失败 7B teacher 的 sequence-mean reward 区分正确/错误 rollout 的 AUROC 与成功 teacher 相近（约 0.75 对 0.73），但训练没有改善。论文把“各位置梯度可能各向异性并相互抵消”明确写成**尚未直接验证的假设**。所以全局 reward 有信息，不保证局部梯度可利用。
+
+## 配方 A：用 off-policy cold start 桥接初始状态
+
+当学生几乎进不了教师熟悉的高概率区域，纯 on-policy 更新可能一直围绕学生已有模式打转。一个保守的两阶段配方是：
+
+```text
+候选 prompts
+  │
+  ├─ 教师生成少量高质量 rollouts
+  │
+  └─ 学生做短 SFT / off-policy distillation
+                │
+                ▼
+        检查 held-out 与 overlap mass
+                │
+                ▼
+        切换到学生 rollout 上的 OPD
+```
+
+### 论文做了什么
+
+Rethinking OPD 使用 Qwen3-1.7B-Base 学生与 Qwen3-4B Non-thinking 教师：
+
+- 从 OpenThoughts 数学子集让教师生成 200K responses；
+- 先用这些教师 rollout 对学生做 SFT；
+- 再在去重后的约 30K 其余 prompts 上做 OPD；
+- 与直接从 base student 开始、使用相同 OPD prompt set 的纯 OPD 对照。
+
+论文报告 SFT 初始化带来更高、更稳定的初始 overlap，较小 entropy gap，以及持续更好的验证表现。
+
+### 如何安全迁移这个想法
+
+1. 从小规模 SFT 开始，保存原始 checkpoint；
+2. 教师 rollouts 与后续 OPD prompts 去重，避免把记忆当迁移；
+3. 同时评估任务能力、通用能力、输出熵与长度；
+4. 只在 cold start 确实改善学生可达状态后切换 OPD；
+5. 对照 `SFT only`、`OPD only`、`SFT + OPD` 三组。
+
+不要复制 `200K` 当成普遍配方。所需规模依学生起点、领域和 teacher/student gap 而变；SFT 太久也可能把学生多样性或原有能力覆盖掉。
+
+## 配方 B：先做 prompt A/B，而不是只调 loss
+
+同一个数学问题，只改 chat template，就可能改变学生进入的状态以及教师在该状态上的行为。
+
+### 论文做了什么
+
+Rethinking OPD 做了两组受控实验：
+
+- **template 对齐**：同一 DAPO-Math-17K 问题，只比较原 DAPO template 与 JustRL teacher post-training 所用的 template；teacher-aligned template 在论文三个 benchmark 上提高验证表现和 overlap；
+- **content 对齐**：比较 teacher RL 数据中的 DAPO-Math-17K 与已对 DAPO 去重、仅保持同领域的 DeepMath 子集。teacher-aligned prompts 有更高的共享 token 概率质量和更好表现，但 overlap token 数量比例反而更低。
+
+第二组尤其说明：只看 overlap ratio 会误判，必须同时看 overlap mass。
+
+论文还观察到 teacher-aligned prompts 让学生熵明显更低，并建议与 teacher post-training 分布之外的 prompts 混合以维持探索。这个“混合”是由其实验现象支持的实践建议，不是经过所有比例系统验证的定律。
+
+### 你的最小 A/B
+
+固定 teacher、student、优化器和随机种子，只改变一项：
+
+1. 原始产品 template；
+2. teacher 熟悉的 template；
+3. 两者的 prompt 混合。
+
+同时画：held-out task metric、overlap ratio、双方 overlap mass、student entropy、response length。不要用训练集 loss 选 template。
+
+## 第 2 层：监督粒度可能在制造假稳定或真方差
+
+### sampled-token 抖动
+
+检查 log-ratio 的分位数，而不只看均值：
+
+```text
+p01 / p50 / p99 of (student_logp - teacher_logp)
+by token type
+by response position
+by correct vs incorrect rollout
+```
+
+若只有少数特殊 token 或后段 token 极端，优先修 mask / 对齐；若是合法语义 token 的重尾，再比较更大 batch、优势归一化、clip 或 multi-token support。
+
+### top-1 与 sampled-one 不是一回事
+
+Rethinking OPD 在 R1-Distill-1.5B → JustRL-1.5B 的数学配置中比较 sampled-token 与 Top-$k$（$k\in\{1,4,16,64\}$）：
+
+- sampled-token 与多个 Top-$k$ 设置在其三个 benchmark 上相近；
+- Top-1 明显更弱且训练更不稳；
+- 作者解释 sampled token 会按学生概率在训练中覆盖不同高概率 token，而 Top-1 永远选 argmax，选择规则有偏且 rank-1 可能突然翻转。
+
+这是该实验中的结果，不证明 sampled-token 永远足够，也不证明 $k>4$ 在其他任务无收益。正确结论是：**“只用一个随机样本”和“固定选一个 argmax”具有不同的统计性质。**
+
+### top-k 假稳定
+
+top-k loss 很小可能只是尾部被丢掉。至少记录：
+
+- student/teacher/union 中谁选集合；
+- 子集内是否重归一化；
+- 双方 retained mass；
+- 与小批 full-vocabulary KL 的误差；
+- 梯度方向与 full-vocab 的 cosine；
+- top-k membership 的变化率。
+
+详见[监督粒度](/docs/core/granularity)。
+
+## 第 3 层：长轨迹的后半段可能先坏掉
+
+学生越往后生成，前缀越可能偏离教师自然访问的状态。教师仍能返回规范化概率，但“能算”不等于“局部监督仍可靠”。
+
+### Rethinking OPD 的论文特定长轨迹观察
+
+论文用 R1-Distill-1.5B 学生、JustRL-1.5B 教师，在 DAPO-Math-17K 上比较最大 response length：0.5K、1K、3K、7K、10K、15K。
+
+- 0.5K 与 1K 的监督 token 太少，样本效率较差；
+- 3K 与 7K 在该设置中最好；
+- 10K 与 15K plateau 或下降，后期 overlap 下滑，student entropy 与 gradient norm 激增；
+- 15K 运行中，高熵先在 suffix 出现，再向 prefix 传播；teacher entropy 也呈类似趋势；
+- 从长学生 rollout 的不同深度让教师续写，教师准确率增益从 1K prefix 的约 `+0.37` 下降到 16K prefix 的约 `+0.02`。
+
+这说明论文设置中存在“太短信号不足、太长后段失真”的 sweet spot。它**没有**给出通用的 7K 上限，也不能推出所有教师在 16K 都失效。
+
+### 你的长度扫描
+
+不要一开始只跑最大上下文。固定总 token budget，扫描 3–5 个 horizon，并按相对位置分桶：
+
+| 桶 | 建议监控 |
+|---|---|
+| 0–20% | overlap mass、log-ratio、正确性相关性 |
+| 20–50% | teacher continuation gain、entropy gap |
+| 50–80% | gradient norm、极端 advantage 比例 |
+| 80–100% | EOS 率、重复、suffix entropy、teacher PPL |
+
+若后段先恶化，可以依风险从低到高尝试：
+
+1. 截短 rollout，但保持固定 token budget 做公平比较；
+2. horizon curriculum，先短后长；
+3. 对后段 token 降权；
+4. 用局部兼容性做动态截断；
+5. 长段改用 outcome reward / verifier，短段保留密集 OPD；
+6. 在可靠 teacher prefix 上提供补充 off-policy guidance。
+
+前沿方法分别探索这些方向：
+
+- [IW-OPD](https://arxiv.org/abs/2606.22600) 用累计 teacher–student discrepancy 做位置权重；论文的“前 30% 接近全长”是其特定实验观察，不是固定截断规则；
+- [Prune-OPD](https://arxiv.org/abs/2605.07804) 根据 top-k overlap 等局部兼容性降权并动态停止，兼容时仍可保留长窗口；
+- [TrOPD](https://arxiv.org/abs/2606.01249) 划分可靠 trust region 与 outlier，并对异常区比较 clipping、mask、FKL，再加入 teacher-prefix off-policy guidance。
+
+截至本站核验，这三篇 arXiv 页面均未给出已核验的官方训练仓库。因此先把它们当作论文方案与实验结论，不要假装一键配置已经成熟。
+
+## 第 4 层：分布距离太大或熵正在塌缩
+
+### 症状
+
+- student entropy 持续下降，但 pass@k 或开放式质量下降；
+- 少量 token 梯度极端大；
+- teacher 在高熵位置有多个合理选择，student 却过早只押一个；
+- FKL 与 RKL 两个基线分别表现为梯度爆炸与多样性下降。
+
+### 方法地图
+
+- [Entropy-Aware OPD](https://arxiv.org/abs/2603.07079)：按**教师 token 熵**局部路由；低熵位置保留 RKL，高熵位置加入 FKL。不是整次训练全局二选一。
+- [Veto / Adaptive Target Reformulation](https://arxiv.org/abs/2601.07155)：在 student 与 teacher logits 之间构造几何中间目标，缓和一步跨越过大的分布间隙。
+- [AOPD](https://arxiv.org/abs/2605.06387)：正 advantage 区域保留强化，非正区域改做局部 divergence minimization；A 是 Asymmetric，不是 Adaptive。
+
+这些方法控制的是不同变量：teacher entropy、teacher–student target distance、advantage sign。不要把它们统称为“加一个 adaptive KL”。在引入前先分别画 entropy、distance 与 advantage sign 的分桶统计。
+
+## 第 5 层：正确与错误轨迹不该总吃同一种信号
+
+若有可靠 verifier，可以检查：
+
+- 正确 rollout 是否还在被强行拉向 teacher 风格；
+- 错误 rollout 上 teacher 是否真的比 student 更有把握；
+- 同一权重是否让 easy correct 样本淹没困难样本。
+
+[SCOPE](https://arxiv.org/abs/2604.10688) 不是简单给 KL 乘一个正确性分数。它按 verifier correctness 路由：论文方法对错误轨迹做 teacher-PPL 加权 KL，对正确轨迹做 student-PPL 加权 MLE，并进行 group normalization。[官方仓库](https://github.com/machine981/SCOPE) 已公开 recipe 与 verl 代码。
+
+迁移时必须先验证 verifier 误差；错误路由会把 label noise 直接变成目标切换噪声。
+
+## 一套最低成本的排查顺序
+
+### 阶段 1：冻结 32 条 states，不更新参数
+
+1. 审计文本、token、shift、mask；
+2. 比较 sampled、top-k、full-vocab 小样本值；
+3. 记录 teacher/student entropy、overlap ratio 与 mass；
+4. 检查位置分桶与特殊 token 分桶。
+
+### 阶段 2：只跑 10–20 个 step
+
+1. 每 step 做小型 held-out eval；
+2. 记录 checkpoint、sampler version 与 importance ratio；
+3. 画 task metric 对 KL，而不是只画 KL 对 step；
+4. 出现能力回归立即停止，不用“等 loss 收敛”。
+
+### 阶段 3：做三个最有信息量的对照
+
+```text
+A. SFT only
+B. OPD only
+C. short cold start + OPD
+```
+
+再做 prompt template A/B 与短/中/长 horizon 扫描。只有当这些基础对照仍解释不了故障时，再引入 Veto、Entropy-Aware、IW-OPD 或 TrOPD 等更复杂方法。
+
+## 事故记录模板
+
+```text
+symptom:
+first bad step:
+first bad position bucket:
+student / teacher checkpoint:
+sampler lag:
+prompt source + template hash:
+sampling params:
+divergence + support selector + k:
+mask / EOS policy:
+overlap ratio + both-side mass:
+student / teacher entropy by position:
+log-ratio quantiles:
+task metric before / after:
+small full-vocab reference:
+fix attempted and controlled variable:
+```
+
+这份记录比“把 KL coef 从 0.1 调到 0.05”更能帮助下一次实验。
+
+## 自测：不要把相关性写成定律
+
+<details>
+<summary>初始 top-k overlap 低，是否足以判定 OPD 必败？</summary>
+
+不足。它是局部兼容性诊断之一，还要看 overlap mass、教师新能力、prompt、训练动态与任务指标。Rethinking OPD 的结论来自其特定数学实验。
+
+</details>
+
+<details>
+<summary>长轨迹后半段差，是否应该固定只训练前 30%？</summary>
+
+不应该。30% 来自 IW-OPD 的特定实验观察；不同模型、任务和 teacher 会有不同漂移曲线。先做位置诊断，再选择加权、动态截断或混合 outcome reward。
+
+</details>
+
+<details>
+<summary>teacher-aligned prompts 更好，是否应该全部换成 teacher 训练集？</summary>
+
+不应该直接这样推断。Rethinking OPD 同时观察到 student entropy 显著降低，并建议混合分布外 prompts。还需防止数据重合让评测看似提升。
+
+</details>
+
+<Cards>
+  <Card title="重读正确心智模型" href="/docs/start/mental-model">
+    把状态来源、目标、监督粒度和更新器重新分层。
+  </Card>
+  <Card title="核对目标推导" href="/docs/core/objective">
+    排除 KL 数值、policy-gradient surrogate 与时间信用被混写。
+  </Card>
+  <Card title="查 2026 方法地图" href="/docs/frontier/methods-2026">
+    比较各方法到底改了状态、支持集、目标还是位置权重。
+  </Card>
+</Cards>
+
+## 一手资料
+
+- [Rethinking On-Policy Distillation](https://arxiv.org/abs/2604.13016) / [官方代码](https://github.com/thunlp/OPD)
+- [Revisiting On-Policy Distillation](https://arxiv.org/abs/2603.25562v2) / [官方代码](https://github.com/hhh675597/revisiting_opd)
+- [The Many Faces of OPD](https://arxiv.org/abs/2605.11182)
+- [IW-OPD / Position Bias](https://arxiv.org/abs/2606.22600)
+- [Prune-OPD](https://arxiv.org/abs/2605.07804)
+- [TrOPD](https://arxiv.org/abs/2606.01249)
+- [Entropy-Aware OPD](https://arxiv.org/abs/2603.07079)
+- [Veto / Adaptive Target Reformulation](https://arxiv.org/abs/2601.07155)
+- [SCOPE](https://arxiv.org/abs/2604.10688) / [官方代码](https://github.com/machine981/SCOPE)

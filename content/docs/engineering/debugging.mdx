@@ -1,0 +1,230 @@
+---
+title: verl OPD 故障排查：从 teacher 到梯度
+description: 用一条可重复的证据链定位启动失败、teacher 阻塞、loss 异常、top-k OOM、token 对齐和异步陈旧度问题。
+---
+
+<Callout type="info" title="先固定版本，再讨论现象">
+  本章逐行核对的是 verl 提交 <code>1ff76cc625e9820d2434dad1b6d9b8e5dd26a359</code>（2026-06-26）。后续版本可能改动配置和 kernel 接线；复现时请把 commit、backend、模型、启动命令与完整报错一起保存。
+</Callout>
+
+排查 OPD 时，最容易犯的错误是只盯着最终 loss。一次训练 step 至少跨过五层：**rollout token → teacher prompt-logprob → TransferQueue → student forward → 聚合与 backward**。应当从数据最早出现的地方向后检查，而不是反向猜测。
+
+## 一张排错路线图
+
+```text
+启动失败？
+  ├─ 是 → 资源池 → teacher 拓扑 → context/temperature → tokenizer/vocab
+  └─ 否
+      ↓
+teacher 请求完成？
+  ├─ 否 → server 存活 → replicas/in-flight → 路由 key → max_logprobs
+  └─ 是
+      ↓
+teacher 张量形状、mask、causal shift 正确？
+  ├─ 否 → prompt dummy row → response slice → tool/pad mask
+  └─ 是
+      ↓
+loss 有限且梯度非零？
+  ├─ 否 → 算法组合 → clamp → fused 接线 → mixed precision
+  └─ 是
+      ↓
+same-model 接近 0？任务指标能否改善？
+```
+
+<Callout type="warn" title="先做 same-model plumbing baseline">
+  让 student 与 teacher 指向同一个 checkpoint。蒸馏 loss 应当接近 0，但不必精确等于 0：训练引擎和推理引擎的 dtype、kernel 与数值实现可能不同。这是检查 token、温度、mask 和 loss 接线的最快方法，不是能力实验。
+</Callout>
+
+## 最小证据包
+
+每次失败先记录这些字段。没有证据包，“同一个问题”往往其实是不同问题。
+
+| 类别 | 必须保存 |
+|---|---|
+| 版本 | verl commit；Python、PyTorch、Ray、vLLM/SGLang 版本 |
+| 拓扑 | 节点数、每节点 GPU、每个资源池、student TP/PP/DP、每个 teacher replicas/TP/PP/DP |
+| 模型 | student/teacher repo 与 revision、tokenizer revision、vocab size、special token ids |
+| 算法 | `loss_mode`、`use_policy_gradient`、`use_task_rewards`、`topk`、clamp、loss aggregation |
+| 调度 | `trainer.use_v1`、`trainer_mode`、参数同步周期、staleness threshold |
+| 运行 | 完整 Hydra override、前 3–5 step 指标、第一处 traceback，而不是最后一处级联报错 |
+
+## 启动失败：先查配置约束
+
+| 症状 | 最可能原因 | 源码检查 | 处理 |
+|---|---|---|---|
+| `n_gpus_per_node must be greater than 0` | 开了 distillation，却保留 teacher pool 默认 `nnodes=0` | [`trainer_base.py` L615–624](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_base.py#L615-L624) | 显式设置 `distillation.n_gpus_per_node` 与 `distillation.nnodes` |
+| teacher GPU sum mismatch | teacher 拓扑之和不等于 pool 容量 | [`distillation.py` L274–287](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L274-L287) | 核对下式，不要靠“应该刚好” |
+| `replica ... span N nodes` | replica 所占 bundle 与声明节点跨度不一致 | [`teacher_model.py` L103–144](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_model.py#L103-L144) | 调整 teacher 顺序、TP/DP/PP 或 replica 数 |
+| 多 teacher 后找不到默认 teacher | 配置解析会移除占位 entry `teacher_model` | [`distillation.py` L239–257](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L239-L257) | 把真实 entry 改名为 `math`、`code` 等，并同步 routing value |
+| context length assertion | teacher 少容纳了最后一个生成占位 | [`distillation.py` L172–185](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L172-L185) | teacher `max_model_len ≥ prompt_length + response_length + 1` |
+| prompt logprobs temperature 报错 | teacher inference temperature 不是 1.0 | [`teacher_manager.py` L30–43](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_manager.py#L30-L43) | 无论 student rollout 温度如何，都显式设 teacher `inference.temperature=1.0` |
+| `max_logprobs` 不足 | vLLM 显式值小于 `topk` | [`distillation.py` L194–208](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L194-L208) | 删除手工值让配置自动补齐，或令它不小于 K |
+| `k1 + direct` 直接拒绝 | sampled-action k1 没有 direct path 所需的可用 teacher 梯度 | [`distillation.py` L120–124](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L120-L124) | 用 `k1 + PG`，或改为 `k3 + direct` / `forward_kl_topk + direct` |
+
+teacher 资源必须满足：
+
+$$
+\sum_j n_{\text{replica},j}\,TP_j\,DP_j\,PP_j
+=n_{\text{gpu/node}}\,n_{\text{node}}.
+$$
+
+这不是“最多不超过”，而是当前校验要求的**精确相等**。
+
+### tokenizer / vocab 不兼容是最危险的静默错误
+
+当前原生路径把 student 的 token ids 原样送给 teacher；teacher 返回的 global vocab ids 又直接被 student logits `gather`。相关入口见 [`agent_loop.py` L1016–1020](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/agent_loop/agent_loop.py#L1016-L1020) 和 [`fsdp/losses.py` L115–124](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/fsdp/losses.py#L115-L124)。源码没有证明两个 tokenizer 等价。
+
+因此不能只比较 `vocab_size`。至少检查：
+
+1. tokenizer 文件 hash 或同一 revision；
+2. BOS/EOS/PAD 与所有 special token ids；
+3. 随机抽样 token id 的双向 decode/encode；
+4. 多模态 processor 与占位 token；
+5. teacher top-k 中最大 id 是否小于 student vocab size。
+
+<Callout type="error" title="vocab 大小相同也可能学错">
+  两套 tokenizer 可以有同样数量的 ids，却把同一个 id 映射到不同字符串。此时训练可能不报错，但 student 被拉向错误 token。跨模型家族蒸馏前必须另外设计 token-space 对齐；原生 OPD 配置不会替你完成它。
+</Callout>
+
+## 卡在 teacher：确认它真的返回了 prompt logprobs
+
+当前 V1 原生 teacher manager 是**逐样本**调用 `client.generate`，再依靠 asyncio 与多个 replica 并发；它不是旧 recipe 中的 ZMQ teacher micro-batch 服务。请求使用 `max_tokens=1`，真正需要的是已有 `prompt` 的 logprobs，见 [`teacher_manager.py` L30–73](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_manager.py#L30-L73)。
+
+如果 step 长时间停在 teacher 阶段，按以下顺序看：
+
+1. 每个 teacher server 是否完成启动、health check 与 model load；
+2. routing key 是否把样本送到存在的 entry；
+3. 单 replica 首 token / prompt-logprob latency 是否异常；
+4. in-flight 请求是否只压在一个 replica；
+5. teacher 的 TP/DP/replicas 是算力瓶颈，还是 student actor 在等待；
+6. 超长 response 是否让 teacher 重算整条 prefix 成为主耗时。
+
+多 teacher 的路由缺失会在 [`teacher_manager.py` L86–100](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_manager.py#L86-L100) 明确报错。若数据按 domain 长时间成块排列，即使路由正确也会让某一 teacher 过载；MOPD 应开启 shuffle，并分别看每个 teacher 的队列与延迟。
+
+## 张量不对：检查 dummy、位移和 mask
+
+teacher 引擎对 prompt logprobs 的返回约定并不等于 loss 所需的 response 对齐。verl 做了两次关键变换：
+
+1. vLLM/SGLang 的第一个 prompt token 没有“前一个位置”的预测，返回 `None`；适配层跳过它，并在尾部补一个 dummy 行，使张量长度仍与 token 序列一致。vLLM 路径见 [`vllm_rollout/utils.py` L447–480](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/rollout/vllm_rollout/utils.py#L447-L480)。
+2. 给 response token $y_t$ 的 teacher 分布来自它前一个 causal 位置。`extract_response` 取的是 `[P-1:S-1]`，见 [`padding.py` L129–143](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/utils/padding.py#L129-L143)。
+
+一个最小人工例子：
+
+```text
+tokens:          [p0, p1, r0, r1, r2]
+teacher rows:    [q(p1|p0), q(r0|p0,p1), q(r1|...), q(r2|...), dummy]
+response slice:               [row 1,       row 2,       row 3]
+response_mask:                [  1,           1,           0 ]  # 例：r2 是 pad/tool-hidden
+```
+
+不要用 `torch.roll` 后不处理边界：它会把尾部 dummy 或错误位置卷到开头。逐个打印一条短样本的 token、teacher ids/logprobs、response slice 和 mask，比检查大 batch 均值更有效。
+
+### mask 的三项不变量
+
+- 每个有效 response token 恰好有一个 causal teacher row；
+- pad、截断外 token、被工具交互标记为不可训练的 token 必须为 0；
+- `sum(response_mask)` 应大于 0，且不应大于 response 实际 token 数。
+
+validation 不会查询 teacher：`validate=True` 时 `_compute_teacher_logprobs()` 被跳过。因此验证阶段看到的 task reward/accuracy 不能当作 validation distillation KL；源码入口见 [`agent_loop.py` L1000–1023](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/agent_loop/agent_loop.py#L1000-L1023)。
+
+## loss、梯度或指标异常
+
+| 现象 | 先看指标 | 常见解释 | 下一步 |
+|---|---|---|---|
+| loss 为 NaN/Inf | `loss_min/max`、grad norm、teacher logprob 范围 | 非有限 logprob、极端 ratio、混合精度溢出或 mask 空 | 保存首个非有限 token；减小 batch；临时用 bf16/fp32 对照；核对 clamp |
+| loss 恒为 0 | `response_mask`、teacher/student 差异、`distillation_loss_coef` | mask 全 0、same-model 本来接近 0、pure OPD 路径系数误设、top-k 截断项被 clamp | 先用不同 teacher；打印有效 token 数与逐 token loss |
+| loss 有值但 grad 为 0 | `use_policy_gradient`、loss mode、参数 `requires_grad` | k1 direct 非法；teacher target 被错误处理；fused 输出断开 | 用仓库 canonical 组合复现；对单 micro-batch 检查 backward |
+| k1 loss 正负跳动 | `abs_loss`、PG clipfrac、ppo_kl | k1 是 sampled-action estimator，单 token 可正可负 | 看移动均值、`abs_loss` 和 task 指标，不要要求每 step 单调 |
+| top-k loss 很小但 teacher 很强 | `teacher_mass`、`student_mass`、`overlap_ratio` | K 太小，teacher 概率质量落在截断集合外；或 tokenizer 错位 | 增大 K 做消融；先检查 token-space |
+| PG clipfrac 很高 | `pg_clipfrac`、`ppo_kl`、old logprob | rollout 与 actor 已漂移、学习率/epoch 太大、async 太陈旧 | 减少 actor epochs/学习率；提高同步频率；回到 sync 对照 |
+
+指标由 worker 加上 `actor/` 前缀。常用的是：
+
+- `actor/distillation/loss`：聚合后的未乘总系数蒸馏 loss；
+- `actor/distillation/abs_loss`：estimator 绝对值均值，尤其适合 k1；
+- `actor/distillation/loss_min` / `loss_max`：逐 token 范围，且在 `loss_max_clamp` 之前采集；
+- `actor/distillation/student_mass`：student 在 teacher top-k 集合上的总概率；
+- `actor/distillation/teacher_mass`：teacher top-k 本身覆盖的概率质量；
+- `actor/distillation/overlap_ratio`：teacher 与 student top-k token 集合的交集比例；
+- `actor/distillation/pg_clipfrac` 与 `ppo_kl`：PG-OPD 的 surrogate clipping / policy drift 诊断。
+
+聚合位置见 [`distillation/losses.py` L294–356](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/losses.py#L294-L356)。top-k 是 teacher top-k 支持上的**未重归一化截断近似**，最终负值会被 clamp 到 0；因此 `teacher_mass` 是解释 loss 的必要上下文，不能把该值直接称为 full forward KL。
+
+## OOM 与 fused kernel 边界
+
+普通 FSDP top-k 路径可能 materialize `[B,T,V]` 的 log-softmax。大词表或长上下文下，先按从低风险到高风险的顺序处理：
+
+1. 减少每 GPU micro-batch / dynamic token budget；
+2. 缩短 response，确认不是 padding 浪费；
+3. 开 `use_chunked_topk`，用速度换 log-softmax 峰值显存；
+4. 再考虑 VeOmni fused chunk-top-k，它还能避免完整 lm-head logits 的 materialization；
+5. 最后才改 TP/PP/CP 与整套 backend。
+
+<Callout type="warn" title="不要把 fused 支持想当然">
+  当前源码明确把 teacher top-k fused inputs 接入 VeOmni（[`transformer_impl.py` L867–890](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine/veomni/transformer_impl.py#L867-L890)）。普通 FSDP fused 分支只在模型输出已经含有 <code>fused_linear_aux.distillation_losses</code> 时提取，并称其为 VeOmni chunk-top-k 路径（[`FSDP transformer_impl.py` L1120–1133](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine/fsdp/transformer_impl.py#L1120-L1133)）。没有对应 kernel 证据时，普通 FSDP/Megatron 的 top-k baseline 先关闭 fused kernels。
+</Callout>
+
+若报 `KeyError: distillation_losses`，不要只在字典取值处加默认值。应追溯：teacher top-k 张量有没有进入 forward、logits processor 是否在非 fused 分支执行、fused kernel 是否真的输出该字段。隐藏 KeyError 会把“没有蒸馏梯度”伪装成成功运行。
+
+## pure OPD 仍经过 PPO 数据管线
+
+`use_task_rewards=false` 不表示 trainer 会跳过 reward、old logprob 与 advantage。当前实现先计算 PPO loss，再在组合阶段把 policy term 置零；distillation-only 时系数还会被强制为 1。调用顺序可从 [`distillation/losses.py` L165–222](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/losses.py#L165-L222) 看到。
+
+所以：
+
+- 不要因为“只训练 distillation”就删掉 reward dataset schema 或 advantage step；
+- pure OPD 通常关闭 `actor.use_kl_loss` 与 `algorithm.use_kl_in_reward`，避免额外 reference model 计算；
+- 如果保留 task reward，请把最终 loss 拆成 task 与 distillation 两项分别记录，避免总和掩盖一项失效。
+
+## async：loss 正常也可能不是严格 on-policy
+
+V1 的 `colocate_async` / `separate_async` 与 fully-async 路径允许 rollout 来自旧版本 student。它们优化吞吐，但更准确的名字是**有限陈旧度 OPD**。
+
+当 sync 正常、async 退化时，记录：
+
+| 变量 | 问题 |
+|---|---|
+| trajectory model version | 这条 response 由哪个 student 版本生成？ |
+| update model version | 它在哪个 actor 版本上反向传播？ |
+| staleness | 两者相差多少 step / version？ |
+| sync period | 参数多久推送一次 rollout engine？ |
+| correction / drop | 过旧 trajectory 是校正、丢弃，还是照常训练？ |
+
+先把同一配置切回 `trainer_mode=sync`。如果 sync 恢复，优先调小 staleness threshold、缩短同步周期或减少 actor 更新强度，而不是先怀疑 teacher 数学。
+
+## 两个源码审计风险：需要回归，不是已确认 bug
+
+<Callout type="warn" title="风险 1：global-batch 归一化刷新顺序">
+  静态调用顺序是先 <code>distillation_loss(...)</code>，后 <code>ppo_loss(...)</code>（[`distillation/losses.py` L207–210](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/losses.py#L207-L210)）；但 <code>ActorConfig.global_batch_info</code> 在 <code>ppo_loss()</code> 内才由本 batch 数据刷新（[`workers/utils/losses.py` L57–68](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/utils/losses.py#L57-L68)）。这提示 token-mean、多 DP 或 batch token 数变化时，首个/后续 micro-batch 可能使用空值或旧值。当前只有静态证据，没有 GPU E2E 证明；应以连续两个不同 token count 的 batch 对照手算 scalar/gradient。
+</Callout>
+
+<Callout type="warn" title="风险 2：FSDP / Megatron 的 teacher_mass clamp 口径">
+  FSDP 在 logprob clamp 前计算 mass（[`fsdp/losses.py` L125–129](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/fsdp/losses.py#L125-L129)），Megatron 则在 clamp 后构造 teacher probabilities 与 mass（[`megatron/losses.py` L111–120](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/megatron/losses.py#L111-L120)）。当 teacher tail 低于 <code>log_prob_min_clamp</code> 时，两 backend 的监控口径可能不同。它首先是 metric 语义风险，不等于主 loss 或梯度已被证明错误。
+</Callout>
+
+这两项的正确表达是“建议新增回归测试”，不是“verl 存在 bug”。可复现测试应固定同一 logits、mask、clamp 和 global token count，并比较 scalar、per-token loss、gradient 与 mass 指标。
+
+## 十分钟分诊清单
+
+- [ ] commit、backend 和完整命令已保存；
+- [ ] teacher GPU 数严格满足拓扑等式；
+- [ ] teacher context 包含 `+1`，temperature 明确为 1.0；
+- [ ] tokenizer revision、special ids 与 vocab 语义一致；
+- [ ] 一条短样本的 causal shift 与 response mask 已人工核对；
+- [ ] same-model loss 接近 0，且不同 teacher 时 loss/grad 有限非零；
+- [ ] top-k 同时看 `teacher_mass`、`student_mass` 与 overlap；
+- [ ] ordinary FSDP/Megatron top-k baseline 未误开无接线证据的 fused path；
+- [ ] async 退化已用 sync 同配置对照；
+- [ ] 结论区分“日志证实”“源码推断”“仍需回归验证”。
+
+<Cards>
+  <Card title="逐行看数据如何对齐" href="/docs/engineering/verl-codewalk">
+    从 teacher dummy row 到 causal slice、loss 与 backend backward。
+  </Card>
+  <Card title="回到配置手册" href="/docs/engineering/config-runbook">
+    核对算法组合、资源池、MOPD 与 backend 选择。
+  </Card>
+  <Card title="按最小实验开始" href="/docs/practice/first-run">
+    用 same-model 与真实 teacher 两阶段实验建立可调试 baseline。
+  </Card>
+</Cards>

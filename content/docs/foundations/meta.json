@@ -1,0 +1,5 @@
+{
+  "title": "算法基础",
+  "defaultOpen": true,
+  "pages": ["post-training-map", "why-on-policy", "kl-divergence", "ppo-bridge"]
+}

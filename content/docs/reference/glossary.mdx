@@ -1,0 +1,69 @@
+---
+title: 术语表
+description: OPD、蒸馏与 RL 工程中高频术语的简明解释，以及最容易混淆的边界。
+---
+
+这份术语表按“能否帮助你读公式与源码”来写，不追求教科书式穷尽。遇到同一名词在不同论文中定义不同，优先回到该论文的符号表与实现。
+
+## 状态、策略与数据
+
+| 术语 | 在本课程中的意思 | 不要混淆 |
+| --- | --- | --- |
+| **policy / 策略** | 给定 prompt 与已有 prefix 后的 next-token 分布 | 不只是最终生成的一条文本 |
+| **state / 状态** | 通常指 `(x, y_{<t})`：prompt 加上当前位置前的 response prefix | LLM 没有显式环境 state tensor 也能使用这个视角 |
+| **trajectory / rollout** | 从策略自回归采样的一串 response token | dataset 中固定 response 不一定是当前 rollout |
+| **on-policy** | 训练状态/轨迹来自当前或足够新的 student policy | 不等于“使用 PPO”，也不规定 KL 方向 |
+| **off-policy** | 训练样本来自其他策略、旧 checkpoint 或固定缓存 | 不一定错误；SFT 与 cold start 常是有意的 off-policy 阶段 |
+| **exposure bias** | 训练时看到的 prefix 与部署时模型自己生成的 prefix 不一致 | 不是所有错误累积都能只用这一个词解释 |
+| **prompt distribution** | 训练 prompt 的领域、难度、格式和长度分布 | prompt 本身也会决定访问哪些状态 |
+
+## 分布与目标
+
+| 术语 | 简明解释 | 关键提醒 |
+| --- | --- | --- |
+| **logit** | softmax 前的未归一化分数 | 温度通常作用于 logits，再计算概率 |
+| **log-prob** | 某 token 在给定 prefix 下概率的对数 | teacher/student 必须对同一 token、同一位置打分 |
+| **entropy** | 单个分布的不确定性/扩散程度 | 低 entropy 不自动等于高质量 |
+| **cross-entropy** | 用一个目标分布评价另一个分布 | hard-label NLL 是其特例 |
+| **Forward KL** | 常写作 `D_KL(teacher || student)` | 倾向覆盖 teacher 有质量的区域；命名按论文约定核对 |
+| **Reverse KL** | 常写作 `D_KL(student || teacher)` | 可在 student sample 上做 Monte Carlo；不是天然等于 sampled-token 实现的全部细节 |
+| **JSD** | 对称、有界的 Jensen–Shannon divergence | GKD 允许选择不同散度，on-policy 与散度方向是独立轴 |
+| **temperature** | 控制 softmax 分布尖锐程度 | rollout temperature 与 scoring temperature 可能是两个不同参数 |
+| **support** | 分布赋予非零或主要概率的 token/状态区域 | top-k support 是人为截断的局部集合 |
+
+## 估计器与训练信号
+
+| 术语 | 简明解释 | 关键提醒 |
+| --- | --- | --- |
+| **sampled-token OPD** | 每个位置只查询/使用学生实际采到 token 的 teacher 与 student log-prob | 给定前缀下可估计 RKL，但方差、stop-gradient 与系统陈旧性要另看 |
+| **top-k OPD** | 在 k 个局部候选上比较分布 | teacher top-k、student top-k、交集、并集与是否重归一化都不同 |
+| **full-vocabulary OPD** | 对每个 prefix 的完整词表分布计算 divergence | 最密的局部信号，代价通常也是最高 |
+| **advantage** | 某动作相对基线“更值得”的更新信号 | OPD 的 log-ratio 信号可被写成 advantage 形式，但不等于一定训练 critic |
+| **importance ratio** | 新旧 student 对同一 token 的概率比 | tinker/verl 中用于多次更新或 PPO-style actor loss；不要与 teacher/student ratio 混淆 |
+| **stop-gradient** | 把某一项当常量，不让梯度穿过 | 会改变“数值相同的式子”对应的实际梯度 |
+| **token mask** | 指定哪些 response token 进入 loss | padding、prompt、EOS、工具调用与特殊 token 的口径必须记录 |
+| **sequence aggregation** | token loss 如何汇总成 sample/batch loss | token-mean 与 sequence-mean 会给长度不同的样本不同权重 |
+
+## 角色与系统
+
+| 术语 | 简明解释 | 关键提醒 |
+| --- | --- | --- |
+| **actor / student** | 被更新的策略模型 | rollout engine 中可能有它的另一份推理权重 |
+| **teacher** | 在 student prefix 上提供分布、log-prob、评分或反馈的策略 | 白盒 logits teacher 与黑盒 outcome teacher 不是同一种接口 |
+| **rollout worker** | 执行解码并返回 response/token mask 的服务或进程 | 权重刷新时机决定数据有多“on-policy” |
+| **reference policy** | KL 约束或 reward correction 的参考分布 | 不必等于 teacher，也不必等于 student 初始模型 |
+| **verifier** | 判断答案/轨迹正确性或质量的模型/规则 | SCOPE 等方法用它做路由，不只是把分数乘到 KL 上 |
+| **FSDP / Megatron / VeOmni** | 不同的训练并行与后端组织方式 | “某算法公式存在”不等于所有 backend 都已完成相同接线 |
+| **TransferQueue** | verl V1 主链中跨角色传递批数据的队列机制 | 读当前源码时不要只沿 legacy trainer 猜主路径 |
+
+## 论文族谱
+
+- **GKD**：2023 年提出 student-generated outputs、teacher feedback、散度选择与 on/off-policy mixture 的奠基工作。
+- **OPD**：本课程主线，通常指 student rollout + teacher 在 student prefix 上的稠密监督。
+- **OPSD**：同一模型在 privileged information 条件下作 teacher，再蒸馏到无特权输入的 student。
+- **G-OPD / ExOPD**：同一篇工作中的广义框架与 reward extrapolation 特例，不是两篇论文。
+- **Veto**：论文 *Stable On-Policy Distillation through Adaptive Target Reformulation* 中的方法名。
+- **AOPD**：Asymmetric OPD；不要误写成 Adaptive OPD。
+- **TrOPD**：Trust Region OPD；与 2023 年 GKD 是两项不同工作。
+
+继续查阅：[分层阅读清单](/docs/frontier/reading-list)。

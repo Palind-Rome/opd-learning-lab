@@ -1,0 +1,169 @@
+---
+title: OPD 生态全景：先看地图，再选方法
+description: 从教师访问方式、监督信号与训练位置出发，认识白盒 OPD、黑盒 OPD、OPSD、OPD–RL、多模态、Agent、框架与工业实践。
+---
+
+OPD 不是某一个固定损失，而是一族训练方法。它们共享的骨架是：**学生先生成自己会遇到的轨迹，教师再在这些学生状态上提供监督**。不同工作真正争论的是：谁来当教师、教师能给什么信号、哪些 token 值得学，以及这份监督怎样进入更新。
+
+<Callout title="这是一张导航地图，不是质量排行榜">
+  本站核对的 AwesomeOPD 2026-06-23 快照共有 139 个主表资源行，其中包含交叉收录和边界方法。数量多不代表每一项都同样成熟，也不代表列表顺序就是推荐顺序。论文是否存在、代码是否公开、结果是否被独立复现，是三件不同的事。
+</Callout>
+
+## 两个问题，先把方法放对抽屉
+
+读到一个新缩写时，先问下面两件事。
+
+1. **学生在哪些状态上学习？** 如果轨迹来自当前或近期学生策略，它具有 on-policy 成分；如果只在固定教师答案上训练，更接近离线蒸馏或 SFT。
+2. **谁在这些状态上给什么监督？** 可能是外部教师的完整 logits、top-k 概率、同一模型在特权上下文下的分布，也可能只有 rubric、语言反馈、判别器分数或最终奖励。
+
+| 家族 | 教师/监督 | 学生轨迹 | 最适合先解决的问题 | 首要风险 |
+|---|---|---|---|---|
+| 外部白盒 OPD | 可访问教师 logits、log-prob 或隐藏表示 | 当前学生 | 强到弱能力迁移、稠密 token 纠错 | 教师在偏离前缀上未必仍“会教” |
+| 黑盒 OPD | 判别器、verbal feedback、rubric、outcome | 当前学生 | 教师 API 不返回 logits | 信号更稀疏，容易滑向普通 RL |
+| OPSD | 同一模型 + 解答、提示、技能或记忆等特权上下文 | 当前学生 | 没有独立大教师，想把上下文能力内化进参数 | 测试时特权信息消失，未必可恢复 |
+| 迭代自举 | 旧 checkpoint、群体最优样本或自博弈对手 | 当前/混合策略 | 持续改进、自训练 | 非平稳教师与确认偏差 |
+| OPD–RL 混合 | token 教师信号 + 序列奖励 | 当前或混合策略 | 同时需要模仿效率与结果探索 | 目标相互拉扯、严格 OPD 边界含混 |
+| 系统与应用扩展 | 多教师、跨 tokenizer、VLM、Agent、draft verifier | 取决于场景 | 把 OPD 放进真实训练栈 | 通信、显存、长轨迹、工具状态与陈旧数据 |
+
+## 四条主干
+
+<Tabs items={['外部白盒', '黑盒教师', 'OPSD', 'OPD–RL']}>
+  <Tab value="外部白盒">
+
+外部白盒是最接近“教练逐步看学生解题”的分支。教师和学生看到同一个学生前缀，教师为下一 token 提供分布。代表性的演进可以分成三层：
+
+- **基础目标**：[MiniLLM](https://github.com/microsoft/LMOps/tree/main/minillm)、[GKD](https://arxiv.org/abs/2306.13649)、[DistiLLM](https://github.com/jongwooko/distillm) 研究 reverse KL、JSD、skew KL 与 on/off-policy 混合。
+- **稳定目标**：[Veto](https://arxiv.org/abs/2601.07155) 构造中间目标，[Entropy-Aware OPD](https://arxiv.org/abs/2603.07079) 按教师熵调整 mode-seeking 与 mode-covering，[Revisiting OPD](https://github.com/hhh675597/revisiting_opd) 改用教师支持的局部 top-k 并处理特殊 token。
+- **长轨迹可靠性**：[TRD](https://github.com/louieworth/trd) 在轨迹层修正 prefix failure，[FiRe-OPD](https://github.com/YuYingLi0/FiRe-OPD) 先按轨迹硬过滤、再按 token 软加权，[Prune-OPD](https://arxiv.org/abs/2605.07804) 在发生 prefix drift 后动态降权和截断。
+
+白盒 OPD 的代价也很直接：教师必须对学生 rollout 做前向计算，完整词表分布还会带来通信与显存压力。top-k 传输能省资源，但它同时改变了优化估计器，不能只把它当无损压缩。
+
+  </Tab>
+  <Tab value="黑盒教师">
+
+当商业 API 只返回文本或分数时，仍可让学生先 rollout，再请教师评价这些轨迹：
+
+- [GAD](https://ytianzhu.github.io/Generative-Adversarial-Distillation/) 用判别器式信号；
+- [OVD](https://arxiv.org/abs/2601.21968) 研究 verbal distillation；
+- [SPOT](https://github.com/Visual-AI/SPoT) 让黑盒 oracle 对失败轨迹做近邻修订；
+- [ROPD](https://github.com/Peregrine123/ROPD_official) 从教师–学生对比中生成 prompt-specific rubric，再给学生 rollout 打分；
+- [SODA](https://arxiv.org/abs/2604.03873) 被作者描述为 semi on-policy black-box distillation。
+
+黑盒方法保住了“在学生状态上训练”这一半，但不一定保有白盒 logits 那样的逐词高带宽监督。判断它是不是严格 OPD，不能只看标题，要检查监督是否真的落在学生样本上，以及更新究竟是 token-level imitation 还是普通的 sequence-level policy gradient。
+
+  </Tab>
+  <Tab value="OPSD">
+
+OPSD 把“更强教师”换成“同一模型在更有利上下文中的自己”。例如 [Self-Distilled Reasoner](https://github.com/siyan-zhao/OPSD) 中：
+
+- student 只看问题；
+- teacher 额外看到已验证的推理轨迹；
+- 两者在 student 自己生成的前缀上做分布匹配。
+
+这个模板随后扩展到 [OPCD](https://arxiv.org/abs/2602.12275) 的上下文内化、[CRISP](https://github.com/HJSang/CRISP_Reasoning_Compression) 的推理压缩、[Skill-SD](https://skill-sd.github.io/) 的技能条件、[COPSD](https://github.com/cisnlp/COPSD) 的跨语言特权信息，以及 [d-OPSD](https://github.com/xingzhejun/d-opsd-code) 的 diffusion LLM。
+
+<Callout title="OPSD 最容易被误解的地方">
+  “teacher 和 student 是同一个模型”不代表两者输入相同。真正的能力差来自 privileged information。若它只是共享规则或稳定偏好，参数内化较有希望；若它是每道题独有、测试时完全缺失的答案信息，学生只能学习这些有特权策略的聚合，未必能重建缺失事实。这个限制由 [The Many Faces of OPD](https://arxiv.org/abs/2605.11182) 明确讨论。
+</Callout>
+
+  </Tab>
+  <Tab value="OPD–RL">
+
+OPD 与 RL 不是非此即彼。很多方法把教师的 token 信号放进 PPO/GRPO 一类训练中，再保留 verifier 或环境的序列奖励：
+
+- [AlignDistil](https://github.com/songmzhang/AlignDistil) 把对齐目标写成 adaptive policy distillation；
+- [KDRL](https://arxiv.org/abs/2506.02208) 联合 KD 与 RL；
+- [RLSD](https://arxiv.org/abs/2604.03128) 用 RLVR 决定更新方向、self-teacher evidence 调节幅度；
+- [TGPO](https://arxiv.org/abs/2605.13230) 把教师 token guidance 与轨迹奖励融合；
+- [G-OPD / ExOPD](https://github.com/RUCBM/G-OPD) 从 KL-constrained RL 视角解耦 reward scale 与 reference model；
+- [OPD+](https://arxiv.org/abs/2606.01039) 重新审视常见 stop-gradient advantage 的偏差。
+
+BoN、混合策略 GRPO、on-policy SFT、旧 checkpoint 教师也常被放在这个篮子里。它们很有启发性，但未必同时满足“当前学生采样”和“教师在这些样本上提供稠密监督”两项严格条件，本站会为这类条目保留边界提示。
+
+  </Tab>
+</Tabs>
+
+## 应用不是另一套算法，而是新的状态空间
+
+### 推理：今天最密集的实验场
+
+数学与代码推理的 rollout 很长，正好暴露 OPD 的核心难题：早期一步走偏，后面的教师监督就可能越来越不可靠。因此 [Rethinking OPD](https://github.com/thunlp/OPD)、[Revisiting OPD](https://github.com/hhh675597/revisiting_opd)、[IW-OPD](https://arxiv.org/abs/2606.22600)、[Prune-OPD](https://arxiv.org/abs/2605.07804) 等都以长链推理为主要试验台。不要据此反推“OPD 只适用于数学”；它只是最容易测量正确性和漂移的环境。
+
+### 多模态：教师与学生甚至不在同一种输入空间
+
+- [VOLD](https://walidbousselham.com/VOLD/) 把文本 LLM 的推理迁移给 VLM；
+- [Video-OPD](https://arxiv.org/abs/2602.02994) 与 [X-OPD](https://arxiv.org/abs/2603.24596) 扩展到视频和语音；
+- [Uni-OPD](https://github.com/WenjinHou/Uni-OPD) 试图统一 LLM 与 MLLM 配方；
+- [Flow-OPD](https://github.com/CostaliyA/Flow-OPD) 把学生 rollout 的思想带到 flow-matching 图像模型；
+- [Decomposed-OPD / VGS](https://github.com/hee-suk-yoon/Decomposed_OPD) 分析语言先验与视觉 grounding 梯度。
+
+这里的“token”可能变成视觉、音频或去噪步骤，KL 的计算对象也会变化。读论文时应先确认动作空间，再类比语言 OPD。
+
+### Agent 与 embodied：一个错误会跨 turn 传播
+
+Agent 的状态包含工具返回、环境观察和多轮历史。代表项目包括 [VLA-OPD](https://irpn-lab.github.io/VLA-OPD/)、[TCOD](https://arxiv.org/abs/2604.24005)、[Healthcare AI GYM](https://github.com/minstar/Healthcare_GYM)、[HyperEyes](https://github.com/DeepExperience/HyperEyes) 与 [SDAR](https://github.com/ZJU-REAL/SDAR)。工程上必须区分模型 token 与工具 token 的 mask，还要决定教师在哪一 turn 介入；只复用单轮数学配置通常不够。
+
+### Speculative decoding：学生是 draft model
+
+[Online Speculative Decoding](https://github.com/LiuXiaoxuanPKU/OSD)、[DistillSpec](https://arxiv.org/abs/2310.08461)、[EAGLE-3](https://github.com/SafeAILab/EAGLE)、[SpecForge](https://github.com/sgl-project/SpecForge) 与 [Draft-OPD](https://github.com/bingyang-lei/Draft-OPD) 让 drafter 在自己诱导的状态上接受 target/verifier 监督。它们借用了相同的 distribution-shift 思想，但训练对象、接受/拒绝机制和评价目标都不同，适合放在“扩展阅读”而非 LLM post-training 第一课。
+
+## 框架怎么选
+
+<Cards>
+  <Card title="tinker-cookbook：先看懂最小闭环" href="https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation">
+    代码短，适合把 rollout、teacher log-prob 和 loss 对上号。
+  </Card>
+  <Card title="TRL：常规 Trainer 生态" href="https://github.com/huggingface/trl/tree/main/trl/experimental">
+    包含 GKD、GOLD、MiniLLM、self-distillation 等实验实现，适合单机到常规多卡。
+  </Card>
+  <Card title="verl：分布式 OPD 主线" href="https://github.com/volcengine/verl/tree/main/recipe/on_policy_distill">
+    把 actor、rollout、teacher/reference、Ray 与 vLLM/SGLang 串成生产式训练流。
+  </Card>
+  <Card title="KDFlow：KD-first 后端解耦" href="https://github.com/songmzhang/KDFlow">
+    面向 teacher serving、FSDP2 student、跨 tokenizer 与多模态的系统问题。
+  </Card>
+</Cards>
+
+| 框架 | 适合谁 | 先检查什么 |
+|---|---|---|
+| [TRL](https://github.com/huggingface/trl) | 想快速改 trainer 的研究者 | experimental API 会变；确认版本与 loss 实现 |
+| [verl](https://github.com/volcengine/verl) | 多卡、大教师、独立 rollout 服务 | teacher/ref 配置、top-k 传输、mask 与并行后端 |
+| [rllm](https://github.com/rllm-org/rllm) / [SkyRL](https://github.com/NovaSky-AI/SkyRL) | 数学、RL 与 OPD 组合实验 | advantage 定义和 rollout correction |
+| [ROLL](https://github.com/alibaba/ROLL) / [slime](https://github.com/THUDM/slime) | Megatron、大规模 pipeline | OPD 是直接 loss 还是 RL penalty |
+| [NeMo-RL](https://github.com/NVIDIA-NeMo/RL) | NVIDIA 分布式栈 | `kl_type`、teacher 部署与版本兼容 |
+| [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) | 已在其生态里训练 | AwesomeOPD 快照注明其 OPD 依赖 TRL 集成，并非原生 trainer |
+
+## 工业实践：知道“被采用”，不要假装“已公开复现”
+
+公开报告中可看到 OPD 被用于强到弱压缩、多领域能力合并、阶段间抗遗忘与跨模态迁移：
+
+- [Gemma 2](https://arxiv.org/abs/2408.00118) 和 [Qwen3](https://arxiv.org/abs/2505.09388) 是早期最清楚的生产配方入口；
+- [MiMo-V2-Flash](https://github.com/XiaomiMiMo/MiMo-V2-Flash)、[Baichuan-M3](https://github.com/baichuan-inc/Baichuan-M3-235B)、[GLM-5](https://github.com/zai-org/GLM-5) 与 [Nemotron Cascade 2](https://research.nvidia.com/labs/nemotron/nemotron-cascade-2/) 描述多教师、多领域或跨阶段使用；
+- [HY-MT](https://github.com/Tencent-Hunyuan/HY-MT)、[HY-Embodied](https://github.com/Tencent-Hunyuan/HY-Embodied)、[KAT-Coder-V2](https://streamlake.com/product/kat-coder) 与 [Qwen3.5-Omni](https://arxiv.org/abs/2604.15804) 展示翻译、具身、代码 Agent 与音频推理扩展；
+- [DeepSeek-V4](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf) 公开了模型与技术报告入口。
+
+<Callout title="报告、权重和训练代码要分开标">
+  厂商报告中的一句 “we use on-policy distillation” 能证明配方存在，但通常不足以复现 teacher 选择、数据混合、并行策略和全部 loss 细节。只有模型权重或产品页时，本站不会给“训练代码已开源”徽标。GLM-4.5/4.6 等边界案例也不会因为后续模型明确用了 OPD，就倒推前代一定用了同一算法。
+</Callout>
+
+## 如何使用 139 项导航，而不是被缩写淹没
+
+给每个条目做四次过滤：
+
+1. **严格性**：rollout 是否来自当前/近期学生？教师是否真的监督这些 rollout？
+2. **访问条件**：你拿得到 full logits、top-k、hidden state，还是只有 API 文本？
+3. **失败模式**：你面对的是冷启动不兼容、长前缀漂移、多样性塌缩，还是算力/通信瓶颈？
+4. **证据**：只有论文、只有仓库，还是论文和训练入口都在？是否有人独立复现？
+
+这样一来，“最新论文最多”的方法不一定最适合你；与你的教师接口、学生初始化和 rollout 长度相匹配的方法，才是合理起点。
+
+## 下一站
+
+<Cards>
+  <Card title="2026 方法逐项比较" href="/docs/frontier/methods-2026">
+    把 Veto、G-OPD、SCOPE、AOPD、Prune-OPD、IW-OPD、TrOPD 等放到同一组坐标轴上。
+  </Card>
+  <Card title="分层阅读清单" href="/docs/frontier/reading-list">
+    从一篇博客、一个最小 recipe 开始，再进入公式、失败模式与工程实现。
+  </Card>
+</Cards>

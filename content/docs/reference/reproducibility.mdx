@@ -1,0 +1,75 @@
+---
+title: 证据、版本与复现口径
+description: 这份课程如何核验论文和源码，以及读者怎样记录一次可解释的 OPD 实验。
+---
+
+OPD 在 2026 年仍是高速变化的研究主题。同一个 arXiv 编号可能在几周内改动方法表述、实验或代码链接；同一个框架的默认主链也会随版本切换。可靠学习的第一步，是把“我在哪里看到的”记录下来。
+
+## 本课程的证据等级
+
+| 等级 | 本课程采用的含义 | 可以支持的写法 |
+| --- | --- | --- |
+| **E3** | 论文/官方报告 + 作者或机构仓库，并核验到训练入口或核心文件 | “论文与实现均公开”；仍不等于我们已复现结果 |
+| **E2** | 论文一手页面与正文可核验，但未核验到官方训练实现 | “论文已公开；未核验到官方源码” |
+| **E1** | 官方项目页、模型页、仓库说明或链接级盘点 | 只描述项目自述与存在性 |
+| **E0** | 命名含混、失效链接或只有二手说法 | 标为待核验，不进入核心事实层 |
+
+“未核验到官方源码”不是证明全网绝对没有代码；“仓库公开”也不保证训练 recipe 完整、依赖可装或结果可复现。
+
+## 这次核验了什么
+
+- 本地 AwesomeOPD 快照的 **139 个主表资源行**进入完整导航，但不把列表顺序当质量排名；
+- 用户点名的 2026 论文逐项核对 arXiv 最新版本、准确标题、方法差异和官方代码状态；
+- tinker-cookbook 固定到本地提交并沿函数与行号追踪训练数据流；
+- verl 以本地源码的默认 `trainer.use_v1=true` 主链为准，区分 legacy、同步 V1 与 fully async 文档；
+- 本地静态分析覆盖源码路径与行号，但当前环境没有 GPU/PyTorch 运行条件，因此不声称完成训练复现。
+
+## 快速变化的命名纠错
+
+- `G-OPD / ExOPD` 是同篇论文里的框架与特例；
+- `Adaptive Target Reformulation / Veto` 是论文机制描述与方法名；
+- `AOPD` 的 A 是 **Asymmetric**；
+- 用户材料中的 `TrOPDGKD` 应拆成 [TrOPD](https://arxiv.org/abs/2606.01249) 与 [GKD](https://arxiv.org/abs/2306.13649)；
+- *The Many Faces of OPD* 是诊断研究，不是可直接替换 trainer 的单一 loss；
+- Formula-Driven Survey 中的 GAE-OPD、CR-OPD 是研究议程，不应写成已验证 SOTA。
+
+## 复现实验最少记录这些字段
+
+```yaml
+code:
+  repository: https://github.com/...
+  commit: <full sha>
+  local_patches: <diff or none>
+models:
+  student: <exact revision>
+  teacher: <exact revision>
+  tokenizer: <exact revision>
+data:
+  prompt_source: <dataset + split + filters>
+  chat_template: <hash or file>
+rollout:
+  temperature: 1.0
+  top_p: 1.0
+  max_response_length: 2048
+objective:
+  divergence: reverse_kl
+  estimator: sampled_token
+  aggregation: token_mean
+  masks: [response, padding, special_tokens]
+system:
+  backend: fsdp
+  teacher_serving: <engine>
+  weight_refresh: <when/how>
+evaluation:
+  tasks: [...]
+  seeds: [...]
+  decoding: <exact config>
+```
+
+此外保留原始曲线：按位置的 KL/log-ratio、teacher/student entropy、response length、有效 token 数、吞吐、OOM/retry、下游任务分数与样例输出。只保存最终 checkpoint 会让许多失败原因永远不可追踪。
+
+## 如何阅读网站中的结论
+
+看到“论文发现”时，默认含义是：**作者在其模型、数据、解码和评测设置中报告**。如果我们把多篇工作放到一个统一框架中，这是教学上的综合；如果从源码行为推导出风险，会明确写“静态审计推断”或“待回归验证”。
+
+最后核验日期：**2026-07-13（Asia/Shanghai）**。

@@ -1,0 +1,472 @@
+---
+title: OPD 训练指标与诊断
+description: 联动观察 loss、教师 KL、importance ratio、entropy、长度、top-k overlap、位置分解与下游评测。
+---
+
+<Callout type="warn" title="没有一个指标能单独宣布成功">
+  OPD 的训练数据分布会随学生更新而移动。loss 下降可能来自真正对齐，也可能来自 response 变短、entropy 坍缩、访问状态变窄或 reduction 改变。结论必须由优化健康、分布对齐、生成行为和下游能力共同支持。
+</Callout>
+
+最小仪表盘分四层：
+
+| 层 | 回答的问题 | 核心指标 |
+|---|---|---|
+| 优化健康 | 梯度和更新是否正常？ | loss、LR、grad norm、learner/sampler ratio |
+| 教师对齐 | 学生是否更接近教师？ | teacher log-ratio / KL、overlap、entropy gap |
+| 生成行为 | 模型是否用异常方式让指标变好？ | entropy、response length、stop reason、位置分解 |
+| 真实能力 | 最终任务和原能力是否改善？ | downstream eval、保持性 eval、成本 |
+
+## 先固定日志口径
+
+每个 run 都应记录：
+
+- 模型与 checkpoint 哈希；
+- teacher 版本；
+- tokenizer、chat template、special tokens；
+- prompt 数据版本与采样权重；
+- rollout temperature、top-p、top-k、max tokens；
+- $B$、$G$、有效 trajectories 和有效 tokens；
+- loss reduction：sum、token mean、sequence mean 或 prompt mean；
+- sampler policy version 与 learner step；
+- eval decoding 与样本数。
+
+如果口径不同，两个数即使名字都叫 <code>teacher_kl</code> 也未必能横向比较。
+
+## 1. Loss：它只告诉你“优化器在做什么”
+
+Tinker importance-sampling token loss：
+
+$$
+\ell_t^{\mathrm{train}}
+=-\rho_t A_t,
+\qquad
+\rho_t=
+\frac{p_{\mathrm{learner}}(a_t\mid s_t)}
+{p_{\mathrm{sample}}(a_t\mid s_t)}.
+$$
+
+### 必须同时记录
+
+- <code>loss_sum</code>；
+- <code>loss_token_mean = loss_sum / valid_tokens</code>；
+- <code>loss_sequence_mean</code>；
+- <code>valid_tokens</code>、<code>valid_sequences</code>；
+- learning rate；
+- gradient norm；
+- optimizer step 是否跳过；
+- mixed-precision overflow / NaN 次数。
+
+### 为什么 Raw Loss 很难跨实验比较
+
+- sum reduction 会随 response tokens 增长；
+- <code>kl_penalty_coef</code> 线性缩放 advantage；
+- learner/sampler ratio 改变 loss 尺度；
+- 每步学生 rollout 不同，训练分布在移动；
+- policy loss 可以为负，不像交叉熵那样必须大于 0。
+
+因此，loss 更适合判断“当前优化是否数值健康”，不适合单独判断“能力是否提高”。
+
+<Callout type="info" title="一个好习惯">
+  每次图表都把 loss 与 valid tokens、response length、LR 画在同一时间轴上。否则长度突然减半会让 loss sum 看起来“飞速改善”。
+</Callout>
+
+## 2. Teacher KL / Log-ratio：学生是否贴近教师
+
+sampled-token OPD 对每个学生 token 记录：
+
+$$
+z_t=
+\log p_{\mathrm{sample}}(a_t\mid s_t)
+-\log q_{\mathrm{teacher}}(a_t\mid s_t).
+$$
+
+在 $a_t\sim p$ 且分布口径一致时：
+
+$$
+\mathbb E[z_t]
+=D_{\mathrm{KL}}(p_t\|q_t)\ge 0.
+$$
+
+### 至少记录这些统计
+
+- masked mean；
+- median；
+- standard deviation；
+- p10 / p90 / p95 / p99；
+- min / max；
+- 正值比例与负值比例；
+- 按 dataset、prompt domain、正确/错误 rollout 分组；
+- 按位置分桶。
+
+### 为什么有限 Batch 可以小于 0
+
+单 token 的 $z_t$ 可正可负；非负性属于完整期望。有限样本均值偶尔为负不一定是 bug。若长期大幅为负，则检查：
+
+1. sampling log-prob 是否对应真实温度/截断分布；
+2. teacher 与 sample token 是否错位；
+3. mask 是否混入 prompt/padding；
+4. tokenizer 或 chat template 是否不一致；
+5. metric 是否记录了相反方向。
+
+Tinker 把 mask 后的 sampled log-ratio 记录为 <code>teacher_kl</code>：[train_on_policy.py L86–130](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L86-L130)。
+
+### Advantage 也要单独记
+
+$$
+A_t=-\beta z_t.
+$$
+
+记录 advantage mean、绝对值、正负比例与 quantiles，能区分 KL 真正变小，还是 <code>kl_penalty_coef</code>、mask 或长度改变了有效梯度。
+
+## 3. Learner / Sampler Ratio：更新是否还“近端”
+
+教师 log-ratio 回答“学谁”，learner/sampler ratio 回答“这一步走了多远”：
+
+$$
+\delta_t=
+\log p_{\mathrm{learner}}(a_t\mid s_t)
+-\log p_{\mathrm{sample}}(a_t\mid s_t),
+\qquad
+\rho_t=\exp(\delta_t).
+$$
+
+### 记录
+
+- $\delta_t$ 的 mean、mean absolute、p95、p99、max；
+- $\rho_t$ 的 median、p95、p99；
+- fraction outside $[0.8,1.2]$ 或你的 PPO clip 区间；
+- clip fraction（若使用 PPO/CISPO）；
+- sampler version lag；
+- 每个 substep 后的 ratio。
+
+### 可选：Effective Sample Size Proxy
+
+$$
+\mathrm{ESS}
+=\frac{(\sum_i\rho_i)^2}{\sum_i\rho_i^2}.
+$$
+
+把它除以 token 数得到比例，可发现少数超大 ratio 是否支配更新。但自回归 token 相关，ESS 只是诊断 proxy，不是严格独立样本保证。
+
+### 红旗
+
+- p99 ratio 暴涨；
+- mean 接近 1，但 max 极大；
+- sampler lag 增大时 loss 同步震荡；
+- clip fraction 长期接近 1。
+
+这通常指向学习率过大、同批数据更新过多、substeps 过多或异步 rollout 太陈旧，而不是 teacher 质量问题。
+
+来源：[Tinker Importance Sampling](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/)；[PPO ratio 与 clipping](https://arxiv.org/abs/1707.06347)。
+
+## 4. Entropy：学生是在对齐，还是在坍缩？
+
+完整 next-token entropy：
+
+$$
+H(p_t)=-\sum_{v\in V}p_t(v)\log p_t(v).
+$$
+
+### 建议记录
+
+- student entropy mean / quantiles；
+- teacher entropy；
+- absolute entropy gap $|H(p_t)-H(q_t)|$；
+- 按位置、domain、正确性分桶；
+- rollout 的 empirical token diversity；
+- 多样本回答的 distinct-n、Self-BLEU 等辅助指标。
+
+### 只有 Sampled Token 时
+
+若 $a_t\sim p_t$：
+
+$$
+\mathbb E[-\log p_t(a_t)]=H(p_t).
+$$
+
+sample surprisal 可估计 entropy，但方差高。使用 temperature、top-p/top-k 截断时，它估计的是实际 proposal distribution 的 entropy，不一定是原模型 softmax entropy。
+
+### 只有 Top-k 时
+
+在 top-k 内重归一化再算 entropy 会忽略尾部质量。应同时记录 top-k entropy、captured mass、$k$，以及 top-k 集合由 student 还是 teacher 选择。不要把 top-k renormalized entropy 当 full-vocabulary entropy。
+
+### 怎么联动解释
+
+- teacher KL 下降、entropy gap 缩小、eval 上升：较健康；
+- teacher KL 下降、student entropy 急降、length 也缩短：可能 mode collapse；
+- overlap 上升但 student entropy 远低于 teacher：可能只集中到极少共享 token；
+- entropy 上升且 teacher KL、ratio 都变坏：可能更新不稳或采样过热。
+
+Rethinking OPD 的成功 run 中，作者观察到 overlap 上升和 entropy gap 收窄；失败 run 从早期停滞。这是经验签名，不是充分条件。[Rethinking OPD §4](https://arxiv.org/abs/2604.13016)
+
+## 5. Response Length：既是行为，也是 Loss 权重
+
+至少记录：
+
+- mean、median、p10、p90、p95、max；
+- hit max-tokens fraction；
+- EOS / stop-string / tool-stop / error fraction；
+- 有效 reasoning tokens 与 final-answer tokens；
+- 按正确/错误、domain、prompt length 分组；
+- 每千生成 token 的任务收益和成本。
+
+### 为什么长度会伪装成进步
+
+- sum reduction：短回答自动有更小 loss sum；
+- token mean：长度改变会改变访问到的位置分布；
+- 截断：长回答后段没有最终答案，task reward 下跌；
+- reverse KL：学生可能集中到更短的教师高概率 mode；
+- RLVR：若 reward 对格式/长度有硬边界，模型可能学长度捷径。
+
+### 长度不是越长越好
+
+Rethinking OPD 在其特定 1.5B reasoning 设置中发现 response length 有 sweet spot：0.5K/1K 监督 token 太少，3K/7K 最强，10K/15K 平台或下降。数值不能直接搬到别的模型；可迁移的是扫描长度并做位置分解。[Rethinking OPD §6.1](https://arxiv.org/pdf/2604.13016)
+
+<Callout type="warn" title="评估长度必须固定解码口径">
+  比较模型时保持 temperature、top-p、top-k、max tokens、stop sequences 和 samples-per-prompt 相同。否则“更长所以更高 pass@k”与“策略真正更好”无法分开。
+</Callout>
+
+## 6. Top-k Overlap：师生局部候选是否兼容
+
+令同一学生访问前缀上：
+
+$$
+S_t^{(p)}=\operatorname{TopK}(p_t,k),
+\qquad
+S_t^{(q)}=\operatorname{TopK}(q_t,k).
+$$
+
+Top-k overlap ratio：
+
+$$
+M_{\mathrm{overlap}}
+=\mathbb E_t\left[
+\frac{|S_t^{(p)}\cap S_t^{(q)}|}{k}
+\right].
+$$
+
+它回答学生与教师的高概率候选 token 有多少重合。[Rethinking OPD §2.3](https://arxiv.org/pdf/2604.13016)
+
+### 只看集合重合还不够
+
+还应记录：
+
+$$
+M_{\mathrm{mass}}^{(p)}
+=\mathbb E_t\left[
+\sum_{v\in S_t^{(p)}\cap S_t^{(q)}}p_t(v)
+\right],
+$$
+
+$$
+M_{\mathrm{mass}}^{(q)}
+=\mathbb E_t\left[
+\sum_{v\in S_t^{(p)}\cap S_t^{(q)}}q_t(v)
+\right].
+$$
+
+论文在其设置中观察到 overlap token 承载两边约 97%–99% 概率质量，并发现成功训练的 overlap 从约 72% 升到 91%；这些是论文结果，不是通用阈值。[Rethinking OPD §4 与 Appendix B.1](https://arxiv.org/abs/2604.13016)
+
+### Overlap-token Advantage
+
+在 overlap 集合内重归一化，可计算：
+
+$$
+\bar p_t(v)
+\left(\log\bar q_t(v)-\log\bar p_t(v)\right).
+$$
+
+它衡量共享区域内部的重新分配。若 overlap mass 很低，仅看这一量会误导。
+
+### 工程代价
+
+overlap 需要 teacher/student top-k；sampled-token Tinker 基础 recipe 默认拿不到。可用小比例 probe batch 定期查询。若师生 tokenizer 不同，token 集合 overlap 没有直接意义，应换文本片段、字节或语义层指标。
+
+## 7. Position Breakdown：不要把整条轨迹平均掉
+
+同一个全局 mean KL 可能隐藏：
+
+~~~text
+前 20% token：教师信号稳定、overlap 高
+中间 50%：开始漂移
+后 30%：entropy gap 与 log-ratio 爆炸
+~~~
+
+### 推荐双重分桶
+
+1. **绝对位置**：0–127、128–255、256–511、512–1023……  
+   分析上下文长度与系统开销。
+2. **归一化位置**：0–10%、10–25%、25–50%、50–75%、75–100%。  
+   比较不同 response length。
+
+每个桶记录 token count、teacher log-ratio、advantage magnitude、student/teacher entropy、entropy gap、top-k overlap / mass、learner/sampler ratio，并按正确/错误 rollout 再分组。
+
+### 为什么后段值得单独看
+
+学生不断生成后，prefix 可能离教师自然轨迹越来越远。Rethinking OPD 报告 teacher reward quality 随 trajectory depth 下降，instability 先在后段出现再向前传播。[Rethinking OPD §6](https://arxiv.org/pdf/2604.13016)
+
+Position Bias 工作在其设置中发现：同 token budget 下，只监督前 30% 可接近标准 OPD，并显著好于只监督后 30%；作者据此提出位置相关权重。[On the Position Bias of OPD §3](https://arxiv.org/abs/2606.22600)
+
+<Callout type="info" title="把论文观察当诊断假设">
+  不要把“前 30%”写死到所有任务。先画自己的 position curves，再决定截断、位置加权或 teacher-compatible prefix weighting。
+</Callout>
+
+## 8. Downstream Eval：训练最终要回答能力问题
+
+### 目标能力
+
+- math：AIME、MATH、AMC 或自有保留集；
+- code：不可见 unit tests、pass@k；
+- instruction following：IF-eval；
+- tool use：任务完成率、工具错误率、平均 turns；
+- domain QA：准确率、引用或事实验证。
+
+### 保持性能力
+
+- 通用 chat / instruction following；
+- 原领域 benchmark；
+- 安全与拒答行为；
+- 输出格式与语言；
+- 长上下文和多轮能力。
+
+### Teacher-gap Recovery
+
+在 teacher 分数高于初始学生、口径相同时：
+
+$$
+\mathrm{GapRecovery}
+=\frac{
+\mathrm{Score}_{\mathrm{after}}
+-\mathrm{Score}_{\mathrm{before}}
+}{
+\mathrm{Score}_{\mathrm{teacher}}
+-\mathrm{Score}_{\mathrm{before}}
+}.
+$$
+
+它表达恢复了教师差距的多少，但 teacher 并非上界，分母很小时也不稳定。Rethinking OPD 用它分析不同教师的 transferable gain。[论文 §3](https://arxiv.org/pdf/2604.13016)
+
+### 计算效率
+
+同时报告 teacher-scored tokens、student rollout tokens、student train tokens、wall-clock、accelerator hours，以及达到某 eval 阈值所需 steps/tokens。
+
+Thinking Machines 的 7–10× steps 与 50–100× compute 是特定 matched experiment 的作者报告，必须连同模型、上下文和 batch 假设一起引用。[Thinking Machines Discussion](https://thinkingmachines.ai/blog/on-policy-distillation/)
+
+## 指标联动诊断表
+
+| 观察组合 | 更可能的解释 | 下一步 |
+|---|---|---|
+| loss 健康、teacher KL 降、overlap 升、entropy gap 缩、eval 升 | 局部对齐与能力改善一致 | 继续，检查保持性与成本 |
+| teacher KL 降、eval 不动、overlap 早已饱和 | 教师可能没有新增能力，或 prompts 太容易 | probe teacher novelty，换保留集 |
+| teacher KL 降、entropy 快速下降、response 变短 | mode collapse 或长度捷径 | 降 LR/系数，检查温度与长度条件评测 |
+| overlap 从一开始低且不升、entropy gap 大 | thinking-pattern 不兼容 | off-policy cold start、对齐模板/prompts |
+| mean ratio 正常但 p99 爆炸、loss 震荡 | 少数 stale 样本支配更新 | 刷新 sampler、减 substeps/LR、考虑 clipping |
+| 全局 KL 正常，后 25% KL/entropy gap 激增 | prefix drift / position bias | 扫 response length，试分位置权重 |
+| task eval 升，通用 IF-eval 降 | 专项学习伴随遗忘 | 混保持数据、交替训练或行为蒸馏 |
+| training KL 很低，held-out KL 与 eval 都差 | prompt 过拟合 | 扩 prompt 分布，分开 train/held-out |
+| length 上升、reward 上升但效率骤降 | 可能靠更多 token 搜索 | 报每千 token reward 与固定预算 eval |
+
+## 一个可落地的日志 Schema
+
+~~~text
+step/
+  optimizer_step
+  sampler_policy_version
+  sampler_lag
+
+batch/
+  prompts
+  trajectories
+  valid_response_tokens
+
+optim/
+  learning_rate
+  grad_norm
+  loss_sum
+  loss_token_mean
+
+teacher/
+  sampled_log_ratio_mean
+  sampled_log_ratio_p95
+  sampled_log_ratio_p99
+  advantage_abs_mean
+
+policy/
+  learner_sampler_log_ratio_abs_mean
+  importance_ratio_p95
+  importance_ratio_p99
+  clip_fraction
+  ess_ratio
+
+generation/
+  entropy_student
+  entropy_teacher
+  entropy_gap
+  response_length_p50
+  response_length_p95
+  truncation_fraction
+
+alignment/
+  topk_overlap_ratio
+  student_overlap_mass
+  teacher_overlap_mass
+  overlap_token_advantage
+
+position/{bucket}/
+  teacher_log_ratio
+  entropy_gap
+  overlap_ratio
+  token_count
+
+eval/
+  target_task
+  retention_task
+  teacher_gap_recovery
+  score_per_1k_generated_tokens
+~~~
+
+## 评测卫生
+
+1. 固定 decoding 参数与 samples per prompt；
+2. 保留完全未训练 prompts；
+3. 报告多个 seed 或置信区间；
+4. train、validation、teacher 数据来源去重；
+5. 同时报告 best 与 final checkpoint；
+6. 不按 training loss 选择下游 test 最优点；
+7. 指标异常时保存原始 trajectories，能回放到 token 级。
+
+<Cards>
+  <Card title="把指标接回训练 Tensor" href="/docs/core/training-loop">
+    查看每个 log-ratio、mask、entropy 与 length 从哪里产生。
+  </Card>
+  <Card title="检查 Tinker 实现" href="/docs/engineering/tinker-cookbook">
+    对照官方 recipe 的 teacher_kl、sampler 刷新和超参。
+  </Card>
+</Cards>
+
+## 自测
+
+1. teacher KL 下降但 response length 同时减半，为什么不能立即宣布成功？
+2. overlap ratio 很高，为什么还要看 overlap mass？
+3. learner/sampler ratio 的 p99 比 mean 更容易发现什么？
+4. 为什么位置分解同时用绝对位置和归一化位置？
+
+<details>
+<summary>查看答案</summary>
+
+1. loss/KL 的样本位置和 reduction 都可能因长度改变；还要看固定口径 eval、entropy 与截断率。
+2. 集合重合可能发生在低概率 token 上；mass 才说明共享集合覆盖了多少分布。
+3. 少数极端 importance weights、stale trajectories 或过大更新。
+4. 绝对位置反映上下文长度与系统成本；归一化位置可比较不同长度回答的前中后段。
+
+</details>
+
+## 一手资料
+
+- [Tinker — Importance Sampling](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/)
+- [Tinker Cookbook — train_on_policy.py](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py)
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [Rethinking On-Policy Distillation](https://arxiv.org/abs/2604.13016)
+- [On the Position Bias of On-Policy Distillation](https://arxiv.org/abs/2606.22600)
+- [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)
+

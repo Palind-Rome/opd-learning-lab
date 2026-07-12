@@ -1,0 +1,18 @@
+{
+  "title": "OPD Learning Lab",
+  "pages": [
+    "index",
+    "---从零开始---",
+    "start",
+    "---算法基础---",
+    "foundations",
+    "core",
+    "---工程与实践---",
+    "engineering",
+    "practice",
+    "---研究前沿---",
+    "frontier",
+    "---随手查---",
+    "reference"
+  ]
+}

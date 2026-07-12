@@ -1,0 +1,95 @@
+---
+title: 学习地图
+description: 从直觉、公式到 verl 源码，选择一条适合你的 OPD 学习路线。
+---
+
+欢迎来到 **OPD Learning Lab**。这里的目标不是让你背下一个 loss，而是让你能回答四个问题：
+
+1. 为什么训练数据必须来自学生当前会到达的状态？
+2. 论文里的 KL，最终在代码里变成了哪些 tensor 和 mask？
+3. teacher、rollout、actor 在 tinker 与 verl 中如何交接数据？
+4. 训练曲线变好时，怎样判断模型真的学到了，而不是熵塌缩、长度漂移或评测偶然波动？
+
+<Callout title="这是一份带版本的教材">
+  2026 年 OPD 研究更新很快。本课程在 **2026-07-13** 核验论文版本、作者仓库与本地源码。实验数字写成“作者报告”，没有官方实现的论文明确标注，研究议程不会被包装成已验证方法。
+</Callout>
+
+## 如果你只有 30 分钟
+
+按这四页读：
+
+<Cards>
+  <Card title="① 三分钟认识 OPD" href="/docs/start/mental-model">
+    用“学生先答、老师沿学生前缀点评”的比喻建立心智模型。
+  </Card>
+  <Card title="② 为什么必须 on-policy" href="/docs/foundations/why-on-policy">
+    看清状态分布、exposure bias，以及 on-policy 与 KL 方向是两条轴。
+  </Card>
+  <Card title="③ 核心目标" href="/docs/core/objective">
+    从序列 reverse KL 拆到逐 token 目标与实际估计器。
+  </Card>
+  <Card title="④ 最小训练循环" href="/docs/core/training-loop">
+    沿一次 step 追踪 prompt、rollout、teacher log-prob、mask 与 update。
+  </Card>
+</Cards>
+
+## 三条完整路线
+
+| 你现在的目标 | 建议顺序 | 到达终点后你能做什么 |
+| --- | --- | --- |
+| **第一次接触 post-training** | 起步 → 基础 → 核心 | 读懂 OPD 论文的目标、图表与主要术语 |
+| **准备跑一次实验** | 核心 → tinker → verl 配置 → 指标 → 排错 | 配置最小实验，知道每个 tensor 从哪里来 |
+| **准备做研究** | KL/估计器 → 失败诊断 → 2026 方法 → 生态全景 | 用统一坐标比较新论文，而不是只看方法名 |
+
+## 整门课的主线
+
+```text
+prompt x
+  │
+  ├─ student rollout:  ŷ ~ πθ(. | x)          ← 决定“在哪里学”
+  │
+  ├─ teacher scores:   log πT(ŷt | x, ŷ<t)    ← 决定“老师怎么说”
+  │
+  ├─ student scores:   log πθ(ŷt | x, ŷ<t)
+  │
+  ├─ estimator + mask + aggregation            ← 决定“代码实际优化什么”
+  │
+  └─ update θ, refresh rollout policy           ← 决定“下一轮数据来自谁”
+```
+
+你会反复看到四层概念。请始终把它们分开：
+
+- **状态分布**：prompt 与 response prefix 从谁来；
+- **目标散度**：想让哪两个分布接近；
+- **估计器**：full vocabulary、top-k 还是 sampled token；
+- **系统实现**：teacher 怎样服务、token 怎样对齐、权重何时刷新。
+
+<OPDCycle />
+
+## 章节导航
+
+<Cards>
+  <Card title="起步：补齐最小预备知识" href="/docs/start/prerequisites" />
+  <Card title="基础：SFT / KD / RL / OPD 地图" href="/docs/foundations/post-training-map" />
+  <Card title="核心：监督粒度实验" href="/docs/core/granularity" />
+  <Card title="工程：tinker-cookbook" href="/docs/engineering/tinker-cookbook" />
+  <Card title="工程：verl 架构" href="/docs/engineering/verl-architecture" />
+  <Card title="实践：第一次可信试跑" href="/docs/practice/first-run" />
+  <Card title="前沿：失败模式与修复" href="/docs/frontier/failure-recipes" />
+  <Card title="参考：术语表" href="/docs/reference/glossary" />
+</Cards>
+
+## 学完了吗？先做三题
+
+<KnowledgeCheck />
+
+## 核心一手资料
+
+- [Thinking Machines Lab: On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [GKD: On-Policy Distillation of Language Models](https://arxiv.org/abs/2306.13649)
+- [tinker-cookbook distillation recipe](https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation)
+- [verl OPD 文档](https://verl.readthedocs.io/en/latest/algo/opd.html) 与 [官方仓库](https://github.com/volcengine/verl/tree/main/recipe/on_policy_distill)
+- [Rethinking On-Policy Distillation](https://arxiv.org/abs/2604.13016)
+- [AwesomeOPD](https://github.com/thinkwee/AwesomeOPD)
+
+下一步：从 [三分钟认识 OPD](/docs/start/mental-model) 开始。

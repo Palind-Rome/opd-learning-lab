@@ -1,0 +1,279 @@
+---
+title: OPD 分层阅读清单：从第一篇博客到源码与前沿
+description: 面向 LLM post-training 初学者的阅读路线，按直觉、数学、实现、失败模式、OPSD、RL 与应用扩展分层，并只链接一手资料。
+---
+
+一口气打开几十篇 OPD 论文，最容易得到的不是理解，而是一串互相覆盖的缩写。更有效的顺序是：**先建立状态分布直觉，再读一个最小实现，然后补公式与失败模式，最后才追前沿变体。**
+
+<Callout title="这份清单只放一手入口">
+  论文链接指向 arXiv，代码指向作者或机构仓库，工业实践指向技术报告或官方项目页。Awesome 列表适合发现条目，但不替代原论文，也不构成质量背书。
+</Callout>
+
+## 先选你的路线
+
+<Tabs items={['零基础', '准备实验', '做研究', '工程部署']}>
+  <Tab value="零基础">
+
+按“直觉 → 基线 → 代码 → 故障”的顺序：
+
+1. [Thinking Machines Lab：On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+2. [GKD：On-Policy Distillation of Language Models](https://arxiv.org/abs/2306.13649)
+3. [tinker-cookbook distillation recipe](https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation)
+4. [Rethinking OPD](https://arxiv.org/abs/2604.13016)
+5. [Revisiting OPD](https://arxiv.org/abs/2603.25562v2)
+
+目标不是记住所有公式，而是能回答：学生样本来自哪里？教师在哪里打分？为什么它比固定教师轨迹更贴近推理时状态？
+
+  </Tab>
+  <Tab value="准备实验">
+
+先确定你使用的训练栈，再围绕它读论文：
+
+1. 最小实现：[tinker-cookbook](https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation)
+2. 常规 trainer：[TRL experimental](https://github.com/huggingface/trl/tree/main/trl/experimental)
+3. 分布式 recipe：[verl on_policy_distill](https://github.com/volcengine/verl/tree/main/recipe/on_policy_distill) 与 [verl OPD 文档](https://verl.readthedocs.io/en/latest/algo/opd.html)
+4. 先避坑：[Revisiting OPD 官方实现](https://github.com/hhh675597/revisiting_opd)
+5. 再看机制：[THUNLP OPD 官方实现](https://github.com/thunlp/OPD)
+
+阅读时把论文符号逐一映射到配置：actor、rollout、teacher/ref、response mask、KL estimator、top-k、normalization 和 sampling 参数。
+
+  </Tab>
+  <Tab value="做研究">
+
+按研究问题而不是按发布时间读：
+
+- **目标几何与多样性**：[Veto](https://arxiv.org/abs/2601.07155)、[Entropy-Aware OPD](https://arxiv.org/abs/2603.07079)、[AOPD](https://arxiv.org/abs/2605.06387)
+- **状态与长时信用**：[Rethinking OPD](https://arxiv.org/abs/2604.13016)、[IW-OPD](https://arxiv.org/abs/2606.22600)、[Prune-OPD](https://arxiv.org/abs/2605.07804)、[TrOPD](https://arxiv.org/abs/2606.01249)
+- **OPD 与 RL 统一**：[G-OPD](https://arxiv.org/abs/2602.12125)、[OPD+](https://arxiv.org/abs/2606.01039)、[Formula-Driven Survey](https://arxiv.org/abs/2606.22793)
+- **失败机制**：[The Many Faces of OPD](https://arxiv.org/abs/2605.11182)、[Revisiting OPD](https://arxiv.org/abs/2603.25562v2)
+
+每篇论文至少复核一个公式、一个核心消融、一个失败设置和一个代码路径；只读摘要不足以比较 estimator。
+
+  </Tab>
+  <Tab value="工程部署">
+
+优先读系统边界，而不是再收集一个 loss：
+
+1. [verl](https://github.com/volcengine/verl)：actor/rollout/ref 的分布式数据流
+2. [KDFlow](https://github.com/songmzhang/KDFlow)：teacher serving、后端解耦、跨 tokenizer 与 VLM
+3. [NeMo-RL distillation](https://github.com/NVIDIA-NeMo/RL)：NVIDIA 并行栈
+4. [ROLL](https://github.com/alibaba/ROLL) 与 [slime](https://github.com/THUDM/slime)：Megatron/大规模 pipeline
+5. [Revisiting OPD repo](https://github.com/hhh675597/revisiting_opd)：mask、top-k、multi-task 和复现实例
+
+部署问题通常来自吞吐、显存、teacher 延迟、rollout 陈旧和 tokenizer，而不是 KL 名称本身。
+
+  </Tab>
+</Tabs>
+
+## 第 0 层：只补真正需要的前置知识
+
+不必先学完整套强化学习，但下面四个概念必须会说人话：
+
+### 0.1 自回归概率
+
+理解一句话的概率如何分解为每个 token 的条件概率，以及 teacher forcing 为什么让训练前缀与推理前缀不同。OPD 的出发点正是：学生需要在**自己会访问的前缀**上学习恢复。
+
+### 0.2 FKL、RKL 与 JSD
+
+- Forward KL 常被解释为 mode-covering：遗漏教师支持的模式代价大；
+- Reverse KL 常被解释为 mode-seeking：学生更倾向集中到教师高概率模式；
+- JSD 用混合分布缓和两个方向。
+
+这只是直觉。实现中是全词表求和、top-k 截断还是单 token 采样，往往比“FKL/RKL”标签更重要。
+
+### 0.3 SFT、RL 与 OPD 的差别
+
+| 方法 | 状态/轨迹来自 | 监督密度 |
+|---|---|---|
+| SFT / 离线蒸馏 | 固定示范或教师轨迹 | 稠密，但状态偏教师 |
+| RLVR / RLHF | 当前学生 rollout | 常为序列级、较稀疏 |
+| OPD | 当前学生 rollout | 教师提供 token/局部/轨迹监督 |
+
+### 0.4 Policy gradient 与 PPO 的最低限度
+
+阅读 [PPO 原论文](https://arxiv.org/abs/1707.06347) 的摘要、surrogate objective 和 clipping 即可。你需要理解旧策略采样、importance ratio、advantage 与多轮 minibatch 更新；不必先掌握所有连续控制实验。
+
+## 第 1 层：三份材料建立完整直觉
+
+<Cards>
+  <Card title="1. Thinking Machines：最好读的第一篇" href="https://thinkingmachines.ai/blog/on-policy-distillation/">
+    用“学生自己下棋、教师逐步点评”解释 on-policy + dense feedback，并给出 reverse-KL recipe。
+  </Card>
+  <Card title="2. GKD：奠基论文" href="https://arxiv.org/abs/2306.13649">
+    看 student-generated outputs、on/off-policy mixture 与可选散度怎样进入统一框架。
+  </Card>
+  <Card title="3. tinker-cookbook：把直觉落到循环" href="https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation">
+    沿着 rollout、teacher log-prob、loss、optimizer 顺序读，不要先钻 SDK 细节。
+  </Card>
+</Cards>
+
+读完后，试着不看材料写出四行伪代码：student rollout、teacher scoring、token loss、student update。如果写不出，先不要进入 2026 方法海洋。
+
+## 第 2 层：补齐历史基线与目标函数
+
+建议顺序如下：
+
+1. [MiniLLM](https://arxiv.org/abs/2306.08543)：用 policy-gradient 视角优化 reverse KL，理解为什么学生采样能缓解 exposure bias；[代码](https://github.com/microsoft/LMOps/tree/main/minillm)。
+2. [GKD](https://arxiv.org/abs/2306.13649)：比较教师轨迹、学生轨迹及其混合，理解 generalized JSD。
+3. [DistiLLM](https://arxiv.org/abs/2402.03898)：看 skew KL 和 adaptive off/on-policy 数据使用；[代码](https://github.com/jongwooko/distillm)。
+4. [DistiLLM-2](https://arxiv.org/abs/2503.07067)：理解教师数据和学生数据为什么可以使用不对称目标；[代码](https://github.com/jongwooko/distillm-2)。
+5. [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388)：看工业配方如何把 off-policy cold start 与 on-policy phase 串起来。
+
+这一层的学习成果不是背下 KL 性质，而是能画出：**谁采样、谁打分、在哪个前缀、对哪个词表支持、梯度流向哪里。**
+
+## 第 3 层：源码路线
+
+### 路线 3A：最小代码
+
+打开 [tinker-cookbook distillation 目录](https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation)，依次回答：
+
+1. rollout 请求使用哪个模型和采样配置？
+2. teacher log-prob 如何与学生 token 对齐？
+3. response token 的 mask 在哪里产生？
+4. loss 是 full distribution 还是 sampled-token estimator？
+5. teacher 是否冻结？同一 batch 会复用几次？
+
+### 路线 3B：TRL trainer
+
+[TRL experimental](https://github.com/huggingface/trl/tree/main/trl/experimental) 适合横向对照 GKD、GOLD、MiniLLM、SDFT 和 self-distillation。重点看 trainer 如何覆写：
+
+- generation / data collation；
+- teacher forward；
+- KL/JSD 计算；
+- Accelerate/DeepSpeed 下的模型放置。
+
+experimental API 可能变化，阅读时记录 commit，而不是只写“使用最新版 TRL”。
+
+### 路线 3C：verl 分布式数据流
+
+先读 [verl OPD 文档](https://verl.readthedocs.io/en/latest/algo/opd.html)，再进入 [recipe/on_policy_distill](https://github.com/volcengine/verl/tree/main/recipe/on_policy_distill)。把系统拆成：
+
+`prompt → actor rollout → teacher/ref scoring → token advantage/loss → actor update → weight sync`
+
+然后检查：
+
+- actor、rollout 和 ref 是否同卡；
+- teacher 返回 full logits、top-k 还是 sampled log-prob；
+- old log-prob 与 current log-prob 在哪里计算；
+- response mask、tool mask 与 padding mask 是否分开；
+- 异步模式下 rollout 相对当前 actor 陈旧多少步。
+
+### 路线 3D：带论文修复的可读仓库
+
+<Cards>
+  <Card title="Revisiting OPD" href="https://github.com/hhh675597/revisiting_opd">
+    Teacher-TopK、top-p、special-token mask、数学/ALFWorld 与多任务示例。
+  </Card>
+  <Card title="THUNLP Rethinking OPD" href="https://github.com/thunlp/OPD">
+    LLaMA-Factory、verl 与 recipe 脚本并存，适合看 cold start 和 prompt 选择。
+  </Card>
+  <Card title="G-OPD" href="https://github.com/RUCBM/G-OPD">
+    看 reference model、reward scale、多教师与 reward correction 如何落到 verl 配置。
+  </Card>
+  <Card title="SCOPE" href="https://github.com/machine981/SCOPE">
+    对照 correctness routing、teacher/student PPL 权重与两条训练路径。
+  </Card>
+  <Card title="OPSD" href="https://github.com/siyan-zhao/OPSD">
+    同模型双上下文、逐 token clipping、TRL GOLD 与完整训练/评测入口。
+  </Card>
+</Cards>
+
+## 第 4 层：失败模式是必读，不是“进阶选修”
+
+按下面顺序读，能少做很多无效超参搜索。
+
+1. [Rethinking OPD](https://arxiv.org/abs/2604.13016)：教师与学生的 thinking pattern、教师是否真的有新能力、cold start 与 prompt selection。
+2. [Revisiting OPD](https://arxiv.org/abs/2603.25562v2)：单 token 信号、学生前缀上的教师可靠性、tokenizer/特殊 token。
+3. [The Many Faces of OPD](https://arxiv.org/abs/2605.11182)：分布失配、biased top-k、初始化与 OPSD 的 PI-free policy 限制。
+4. [Veto](https://arxiv.org/abs/2601.07155)：学生–教师间隙太大时的目标重构。
+5. [Entropy-Aware OPD](https://arxiv.org/abs/2603.07079)：高熵教师 token 与生成多样性。
+
+<Callout title="失败论文之间并不矛盾">
+  它们分别控制 teacher 选择、学生状态、词表支持、目标几何、初始化与 privileged information。一个设置可能同时踩中多种故障。先定位故障轴，再选择修复，比直接堆叠所有新 loss 更可靠。
+</Callout>
+
+## 第 5 层：按研究方向进入 2026 前沿
+
+### 长链推理与信用分配
+
+1. [IW-OPD / On the Position Bias of OPD](https://arxiv.org/abs/2606.22600)
+2. [Prune-OPD](https://arxiv.org/abs/2605.07804)
+3. [Trajectory-Refined Distillation](https://arxiv.org/abs/2606.08432) / [代码](https://github.com/louieworth/trd)
+4. [FiRe-OPD](https://arxiv.org/abs/2606.02684) / [代码](https://github.com/YuYingLi0/FiRe-OPD)
+5. [TrOPD](https://arxiv.org/abs/2606.01249)
+
+比较时分别记录：position weight、drift detector、trajectory rewrite、hard filter/soft weight、trust-region outlier handling。不要把它们统称为“只训练重要 token”。
+
+### 目标分布与 reward 设计
+
+1. [Veto](https://arxiv.org/abs/2601.07155)
+2. [Entropy-Aware OPD](https://arxiv.org/abs/2603.07079)
+3. [G-OPD / ExOPD](https://arxiv.org/abs/2602.12125) / [代码](https://github.com/RUCBM/G-OPD)
+4. [AOPD](https://arxiv.org/abs/2605.06387)
+5. [OPD+](https://arxiv.org/abs/2606.01039)
+6. [Formula-Driven Survey](https://arxiv.org/abs/2606.22793)
+
+最后一篇中的 GAE-OPD、CR-OPD 是研究议程，不应与已有完整实证的方法画成同一种“已验证”节点。
+
+### OPSD 与上下文内化
+
+1. [Self-Distilled Reasoner](https://arxiv.org/abs/2601.18734) / [代码](https://github.com/siyan-zhao/OPSD)
+2. [OPCD](https://arxiv.org/abs/2602.12275)
+3. [GATES](https://arxiv.org/abs/2602.20574)
+4. [CRISP](https://arxiv.org/abs/2603.05433) / [代码](https://github.com/HJSang/CRISP_Reasoning_Compression)
+5. [Skill-SD](https://arxiv.org/abs/2604.10674)
+6. [Why Does Self-Distillation (Sometimes) Degrade Reasoning?](https://arxiv.org/abs/2603.24472) / [代码](https://github.com/beanie00/self-distillation-analysis)
+7. [The Many Faces of OPD](https://arxiv.org/abs/2605.11182)
+
+每篇都写下 teacher 多看了什么 PI，以及测试时为何有可能在没有 PI 的条件下复现该行为。
+
+### 黑盒、Agent 与多模态
+
+- 黑盒：[GAD](https://ytianzhu.github.io/Generative-Adversarial-Distillation/)、[OVD](https://arxiv.org/abs/2601.21968)、[ROPD](https://github.com/Peregrine123/ROPD_official)
+- Agent：[TCOD](https://arxiv.org/abs/2604.24005)、[Healthcare AI GYM](https://github.com/minstar/Healthcare_GYM)、[SDAR](https://github.com/ZJU-REAL/SDAR)
+- 多模态：[VOLD](https://walidbousselham.com/VOLD/)、[Uni-OPD](https://github.com/WenjinHou/Uni-OPD)、[Flow-OPD](https://github.com/CostaliyA/Flow-OPD)、[Decomposed-OPD](https://github.com/hee-suk-yoon/Decomposed_OPD)
+- Draft model：[DistillSpec](https://arxiv.org/abs/2310.08461)、[EAGLE-3](https://github.com/SafeAILab/EAGLE)、[Draft-OPD](https://github.com/bingyang-lei/Draft-OPD)
+
+这些方向改变了状态或动作空间。先确认“一个 step 是 token、turn、工具动作、视觉 token 还是 denoising step”，再移植语言 OPD 的直觉。
+
+## 一份可执行的 7 天入门安排
+
+| 天 | 阅读与动手 | 当天产出 |
+|---|---|---|
+| Day 1 | Thinking Machines blog + SFT/RL/OPD 对比 | 自己画三种方法的数据流 |
+| Day 2 | GKD + MiniLLM 摘要和方法 | 写清 FKL/RKL/JSD、teacher/student rollout |
+| Day 3 | tinker-cookbook | 给每行核心训练代码写中文注释 |
+| Day 4 | verl 文档与本地 recipe | 画 actor–rollout–teacher–update 时序图 |
+| Day 5 | Rethinking + Revisiting | 列出自己的 teacher compatibility 与 mask 检查项 |
+| Day 6 | Many Faces + Entropy-Aware/Veto 二选一 | 写一份失败诊断树 |
+| Day 7 | 从 2026 方法中选一个最匹配的问题 | 做最小对照实验计划，不急着跑大规模训练 |
+
+## 读任何新论文时，用这张八问卡
+
+1. **状态是谁产生的？** 当前学生、旧学生、教师，还是混合策略？
+2. **教师是谁？** 外部模型、同模型 + PI、旧 checkpoint、多教师、verifier 还是 rubric？
+3. **教师能提供什么？** full logits、top-k、sampled log-prob、hidden state、文本反馈或标量？
+4. **优化对象是什么？** FKL、RKL、JSD、policy gradient、MLE，还是它们的路由组合？
+5. **实际 estimator 是什么？** 全词表、截断支持、单 token、return-to-go、是否 stop-gradient？
+6. **哪些数据被过滤或加权？** token、位置、segment、turn、trajectory、正确性、PPL？
+7. **证据有多强？** 哪些模型、数据、预算、指标和消融支持结论？
+8. **代码真的公开到什么程度？** 论文仓库、训练入口、配置、数据、评测、commit 是否齐全？
+
+能回答这八问，你就已经不是在“收集缩写”，而是在比较训练算法。
+
+## 版本提醒
+
+截至 2026-07-13，本清单中的快速迭代条目已核验为：Revisiting OPD v2、G-OPD v2、Entropy-Aware v3、SCOPE v2、Rethinking OPD v2、IW-OPD v3、OPSD v3、AOPD v3、Prune-OPD v3、Many Faces v2、Veto v2、TrOPD v3、Formula-Driven Survey v1。
+
+日常阅读建议链接到不带版本号的 arXiv 页面，以看到最新版；复现实验时必须记录具体版本和代码 commit。
+
+## 继续浏览
+
+<Cards>
+  <Card title="生态全景" href="/docs/frontier/landscape">
+    从教师访问、监督信号、应用和框架理解整个 OPD 地图。
+  </Card>
+  <Card title="2026 方法对照" href="/docs/frontier/methods-2026">
+    精确比较每篇方法改了哪一轴、证据到哪里、代码是否公开。
+  </Card>
+</Cards>

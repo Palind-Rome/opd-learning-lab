@@ -1,0 +1,483 @@
+---
+title: verl OPD 配置与运行手册
+description: 从算法组合、teacher 资源池和 tokenizer 兼容性，到 FSDP、Megatron、VeOmni、MOPD 与 fully async 的选择，给出可执行的启动前检查。
+---
+
+<Callout type="info" title="这不是一份万能启动命令">
+  本章基于 verl 提交 <code>1ff76cc625e9820d2434dad1b6d9b8e5dd26a359</code>。模型显存、Ray 节点拓扑、vLLM/SGLang 版本和数据 schema 都会影响可运行配置。先用本章算清约束，再从仓库同 backend 的官方脚本改起。
+</Callout>
+
+## 先做四个选择
+
+```text
+1. 蒸馏信号
+   ├─ sampled token、通信省 → k1 + PG
+   └─ teacher top-k、分布信号密 → forward_kl_topk + direct
+
+2. 训练 backend
+   ├─ 先跑通 / 通用 HF → FSDP/FSDP2
+   ├─ 大模型 TP/PP/CP → Megatron
+   └─ 大词表 top-k 显存紧 → VeOmni fused
+
+3. teacher 数量
+   ├─ 一个 → single teacher 自动占满 teacher_pool
+   └─ 多个 → MOPD，显式 route + 每个 teacher replicas
+
+4. 调度
+   ├─ 第一个 baseline → V1 sync
+   └─ 吞吐优化 → 在正确性 baseline 后再尝试 async
+```
+
+<Cards>
+  <Card title="还不清楚两类 loss？" href="/docs/engineering/verl-codewalk">
+    先看 k1 PG、direct k3 与 teacher-top-k GKD 的源码映射。
+  </Card>
+  <Card title="准备第一次实验" href="/docs/practice/first-run">
+    从 same-model plumbing baseline 开始，避免一上来混入能力差异。
+  </Card>
+</Cards>
+
+## 官方脚本矩阵
+
+脚本目录：[`examples/on_policy_distillation_trainer`](https://github.com/verl-project/verl/tree/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/examples/on_policy_distillation_trainer)。
+
+| 脚本 | student train | teacher / rollout | 默认算法 | 何时选 |
+|---|---|---|---|---|
+| `run_qwen3_8b_fsdp.sh` | FSDP | vLLM | `k1 + PG` | 通用 text baseline |
+| `run_qwen3_8b_megatron.sh` | Megatron | vLLM | `forward_kl_topk + direct` | 需要 TP/PP 与 top-k GKD |
+| `run_qwen3_0.6b_opd_veomni.sh` | VeOmni/FSDP2 fused | vLLM | `k1 + PG`，可切 top-k | 8-GPU 小模型示例或 fused 实验 |
+| `run_qwen3_vl_8b_fsdp.sh` | FSDP | vLLM | VL、`k1 + PG` | 单个视觉语言 teacher |
+| `run_qwen3_8b_mopd_fsdp.sh` | FSDP | vLLM | text+VL MOPD | 多领域、多 teacher |
+| `run_qwen3_8b_mopd_veomni.sh` | VeOmni fused | vLLM | fused MOPD | MOPD 且 top-k 显存紧 |
+| `run_qwen3_5_4b_fsdp.sh` | FSDP2，GPU/NPU | vLLM | `k1 + PG` | Qwen3.5 与 Ascend/GPU 特定依赖 |
+
+脚本索引与关键 flags 见 [`README.md` L5–24](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/examples/on_policy_distillation_trainer/README.md#L5-L24)。
+
+## 算法组合：先选 canonical，再做消融
+
+<Tabs items={['PG-OPD / k1', 'Top-k GKD', 'Direct k3', 'Task + OPD']}>
+  <Tab value="PG-OPD / k1">
+
+```yaml
+distillation:
+  distillation_loss:
+    loss_mode: k1
+    use_policy_gradient: true
+    policy_loss_mode: vanilla
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    use_task_rewards: false
+```
+
+**teacher payload：** 每个位置 1 个 sampled-token logprob。
+
+**优点：** teacher 通信小，不需要 student full-vocab top-k loss。
+
+**代价：** 单 token 信号方差更高；必须正确处理 stop-gradient、old logprob 和 PPO clipping。
+
+  </Tab>
+  <Tab value="Top-k GKD">
+
+```yaml
+distillation:
+  distillation_loss:
+    loss_mode: forward_kl_topk
+    topk: 64
+    use_policy_gradient: false
+    use_task_rewards: false
+```
+
+**teacher payload：** 每个位置 K 个 global vocab ids 与 logprobs。
+
+**优点：** 同时给多个 teacher-preferred token 方向，分布监督更密。
+
+**代价：** teacher server、通信和 student logits 侧都更贵；这是未重归一化的 teacher-top-k 截断近似，不是 full KL。
+
+  </Tab>
+  <Tab value="Direct k3">
+
+```yaml
+distillation:
+  distillation_loss:
+    loss_mode: k3
+    use_policy_gradient: false
+    use_task_rewards: false
+```
+
+**teacher payload：** sampled-token logprob。
+
+**特点：** 不走 PPO distillation surrogate，直接反传 k3；期望梯度对应 forward-KL GKD 方向。适合做 sampled-signal 与 top-k signal 的成本/方差比较。
+
+  </Tab>
+  <Tab value="Task + OPD">
+
+```yaml
+distillation:
+  distillation_loss:
+    use_task_rewards: true
+    distillation_loss_coef: 1.0
+```
+
+最终：
+
+$$
+\mathcal L=\mathcal L_{task}+\lambda\mathcal L_{distill}.
+$$
+
+先分别记录 `actor/pg_loss` 与 `actor/distillation/loss` 的量级，再调 `distillation_loss_coef`。不要只看总 loss 猜哪一项主导。
+
+  </Tab>
+</Tabs>
+
+配置合法性在 [`DistillationLossConfig.__post_init__`](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L100-L124)：
+
+- `k1 + use_policy_gradient=false` 直接报错；
+- `forward_kl_topk + use_policy_gradient=true` 只 warning，但会浪费多 token 信号；
+- 当前 distillation PG 只支持 `policy_loss_mode=vanilla`。
+
+## 一份单 teacher 的最小配置骨架
+
+```bash
+python3 -m verl.trainer.main_ppo \
+  actor_rollout_ref.model.path="$STUDENT" \
+  data.train_files="$TRAIN_PARQUET" \
+  data.val_files="$VAL_PARQUET" \
+  data.max_prompt_length=1024 \
+  data.max_response_length=2048 \
+  actor_rollout_ref.rollout.name=vllm \
+  actor_rollout_ref.rollout.max_model_len=3073 \
+  algorithm.use_kl_in_reward=false \
+  actor_rollout_ref.actor.use_kl_loss=false \
+  distillation.enabled=true \
+  distillation.n_gpus_per_node=4 \
+  distillation.nnodes=1 \
+  distillation.teacher_models.teacher_model.model_path="$TEACHER" \
+  distillation.teacher_models.teacher_model.inference.name=vllm \
+  distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=2 \
+  distillation.teacher_models.teacher_model.inference.max_model_len=3073 \
+  distillation.teacher_models.teacher_model.inference.temperature=1.0 \
+  distillation.distillation_loss.loss_mode=k1 \
+  distillation.distillation_loss.use_policy_gradient=true \
+  distillation.distillation_loss.use_task_rewards=false
+```
+
+它只是配置骨架；训练 batch、micro-batch、offload、TP/SP/PP 和 GPU memory utilization 必须按模型与机器调整。
+
+## Teacher 配置：四个硬约束
+
+### 1. Context 必须容纳 `prompt + response + 1`
+
+teacher 不生成完整答案，而是评分 student 的完整 prefix。启动时代码要求：
+
+$$
+L_{teacher}\ge L_{prompt}+L_{response}+1.
+$$
+
+随后内部将：
+
+```text
+teacher.prompt_length   ← student prompt_length + response_length
+teacher.response_length ← 1
+```
+
+实现：[`distillation.py` L172–186](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L172-L186)。
+
+### 2. Teacher temperature 必须是 1.0
+
+`_get_teacher_sampling_params()` 对任何非 1.0 teacher temperature 直接 `NotImplementedError`；见 [`teacher_manager.py` L30–43](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_manager.py#L30-L43)。
+
+危险在于 YAML 默认让 teacher temperature 继承 student rollout temperature：[`distillation.yaml` L108–110](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/config/distillation/distillation.yaml#L108-L110)。如果 student rollout 改为 0.7，应显式覆盖：
+
+```bash
+distillation.teacher_models.teacher_model.inference.temperature=1.0
+```
+
+### 3. Student 与 teacher 必须共享 token-id 语义
+
+代码把 student token ids 原样发送给 teacher，又把 teacher top-k global vocab ids 直接拿去 gather student logits。源码没有自动验证：
+
+- tokenizer vocab size；
+- 同一个 id 是否对应同一个 token；
+- BOS/EOS/chat special tokens；
+- multimodal placeholders 与 processor contract。
+
+<Callout type="error" title="同词表大小不等于兼容">
+  两个 tokenizer 即使 <code>vocab_size</code> 相同，也可能把相同整数映射到不同 token。最安全的起点是同一模型家族、相同 tokenizer files 和相同 chat template；多模态还要核对 processor 与 special-token id。
+</Callout>
+
+启动前至少记录：
+
+```text
+student tokenizer path / revision / vocab_size
+teacher tokenizer path / revision / vocab_size
+bos/eos/pad token ids
+chat template hash
+multimodal special-token ids（如适用）
+```
+
+### 4. Top-k backend 上限
+
+top-k 模式：
+
+- vLLM：`engine_kwargs.vllm.max_logprobs` 未设时自动补成 `topk`；显式值更小会报错；
+- SGLang：top-k 是 per-request 参数；
+- 其他 teacher inference engine：当前校验直接不支持 top-k。
+
+实现：[`distillation.py` L188–218](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L188-L218)。
+
+## Teacher GPU 资源计算
+
+单 replica 的 GPU 数：
+
+$$
+W_j=\mathrm{TP}_j\times\mathrm{DP}_j\times\mathrm{PP}_j.
+$$
+
+teacher pool 必须精确满足：
+
+$$
+\sum_j n_jW_j
+=
+\text{distillation.n\_gpus\_per\_node}
+\times
+\text{distillation.nnodes}.
+$$
+
+实现：[`distillation.py` L269–287](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L269-L287)。
+
+### 单 teacher 的自动 replicas
+
+只保留默认 `teacher_models.teacher_model` 时，代码自动：
+
+```text
+num_replicas = teacher_pool_size / per_replica_world_size
+key = "default"
+```
+
+pool 必须能整除单 replica GPU 数；见 [`distillation.py` L289–307](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L289-L307)。
+
+### 例子
+
+```text
+teacher_pool = 4 GPU
+teacher TP=2, DP=1, PP=1
+每 replica = 2 GPU
+自动 replicas = 2
+```
+
+### 总集群 GPU 要相加
+
+官方 `run_qwen3_8b_fsdp.sh` 默认：
+
+```text
+global_pool  = 8 GPU
+teacher_pool = 4 GPU
+总需求       = 12 GPU
+```
+
+脚本证据：[`run_qwen3_8b_fsdp.sh` L10–29, L89–110](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/examples/on_policy_distillation_trainer/run_qwen3_8b_fsdp.sh#L10-L110)。
+
+VeOmni 0.6B 示例则特意用 `7 global + 1 teacher = 8 GPU`：[`run_qwen3_0.6b_opd_veomni.sh` L23–30, L97–126](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/examples/on_policy_distillation_trainer/run_qwen3_0.6b_opd_veomni.sh#L23-L126)。
+
+<Callout type="warn" title="脚本变量名可能误导">
+  一些脚本把写入 <code>distillation.n_gpus_per_node</code> 的变量叫 <code>TEACHER_WORLD_SIZE</code>。多节点时总 teacher GPU 还要乘 <code>distillation.nnodes</code>，不要只看变量名。
+</Callout>
+
+## 节点拓扑：总数正确仍可能放不下
+
+teacher pool 按连续 Ray bundles 线性切给不同 teacher/replica。每个 replica 实际跨节点数必须与 `ceil(W / n_gpus_per_node)` 一致；校验见 [`teacher_model.py` L103–144](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_model.py#L103-L144)。
+
+例如每节点 8 GPU：
+
+```text
+teacher A: 两个 3-GPU replica，占 bundles [0,3), [3,6)
+teacher B: 一个 5-GPU replica，从 bundle 6 开始
+```
+
+B 会跨 node 0 的 `[6,8)` 与 node 1 的 `[8,11)`；但 5 GPU 理论上应装在一个 8-GPU 节点，校验会拒绝。修复选择：
+
+- 调整 teacher 顺序；
+- 改 TP/DP/PP；
+- 改 replicas；
+- 让前一个 teacher 的总占用对齐节点边界。
+
+## 多 teacher / MOPD 配置
+
+<Callout type="error" title="不要把真实首 teacher 继续命名为 teacher_model">
+  YAML 自带一个单 teacher 占位项 <code>teacher_model</code>。一旦添加其他 teacher，代码会把这个默认项 <code>pop</code>。若你把真实第一个 teacher 仍写在该项，它会被静默丢掉。
+</Callout>
+
+正确写法：
+
+```bash
+distillation.enabled=true \
+distillation.teacher_key=data_source \
+distillation.n_gpus_per_node=4 \
+distillation.nnodes=1 \
++distillation.teacher_models.gsm8k.key="openai/gsm8k" \
++distillation.teacher_models.gsm8k.model_path="$MATH_TEACHER" \
++distillation.teacher_models.gsm8k.num_replicas=1 \
++distillation.teacher_models.gsm8k.inference.name=vllm \
++distillation.teacher_models.gsm8k.inference.tensor_model_parallel_size=2 \
++distillation.teacher_models.geo3k.key="hiyouga/geometry3k" \
++distillation.teacher_models.geo3k.model_path="$VL_TEACHER" \
++distillation.teacher_models.geo3k.num_replicas=1 \
++distillation.teacher_models.geo3k.inference.name=vllm \
++distillation.teacher_models.geo3k.inference.tensor_model_parallel_size=2
+```
+
+官方完整示例：[`run_qwen3_8b_mopd_fsdp.sh` L109–150](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/examples/on_policy_distillation_trainer/run_qwen3_8b_mopd_fsdp.sh#L109-L150)。
+
+检查：
+
+- 每条样本的 `data_source` 是否精确为 teacher key；
+- 数据是否 shuffle；
+- 多模态样本是否路由到兼容 processor 的 teacher；
+- 各 teacher replicas 总 GPU 是否精确填满 pool；
+- 连续 bundle 是否跨错节点。
+
+## 选择 FSDP、Megatron 还是 VeOmni
+
+| 维度 | FSDP/FSDP2 | Megatron | VeOmni |
+|---|---|---|---|
+| 上手 | 最直接 | 配置复杂 | 依赖/模型支持需确认 |
+| 模型并行 | FSDP + Ulysses SP | TP/PP/CP/EP | FSDP2 + SP |
+| top-k eager | 支持 | 支持，TP-aware custom autograd | 支持 |
+| top-k fused | 当前普通 FSDP 接线不完整 | 当前 fused 分支未接 top-k processor | 明确支持 `chunk_topk_distill` |
+| 大词表显存 | 可开 chunked log-softmax，但仍有 logits | vocab shard 降单 rank vocab | fused chunk lm-head 最省峰值 |
+| 推荐起点 | 小/中模型 baseline | 已有 Megatron 集群规范 | 需要 fused top-k 时 |
+
+### FSDP top-k OOM 时
+
+默认会 materialize student `[B,T,V]` log-softmax。可开启 dataclass 中的 chunked path：
+
+```bash
++distillation.distillation_loss.use_chunked_topk=true \
++distillation.distillation_loss.chunked_topk_chunk_size=4096
+```
+
+实现注释指出它在长上下文可避免 log-softmax buffer OOM，但短上下文更慢；见 [`distillation.py` L72–82](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L72-L82)。
+
+同时尝试：
+
+- 减小 `ppo_max_token_len_per_gpu` / micro-batch；
+- 减小 response length；
+- 降低 K；
+- 用 gradient checkpointing/offload；
+- 若模型支持，切 VeOmni fused。
+
+### Fused kernel 边界
+
+VeOmni 明确把 teacher top-k 传进 fused loss：[`veomni/transformer_impl.py` L867–890](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine/veomni/transformer_impl.py#L867-L890)。普通 FSDP/Megatron top-k 在没有额外 kernel 证据时先关 `actor_rollout_ref.model.use_fused_kernels`。
+
+## Reference KL 与 task reward 开关
+
+canonical pure OPD 通常同时设置：
+
+```bash
+algorithm.use_kl_in_reward=false \
+actor_rollout_ref.actor.use_kl_loss=false \
+distillation.distillation_loss.use_task_rewards=false
+```
+
+否则：
+
+- trainer 可能额外初始化/forward reference policy；
+- student 同时被 base reference 与 teacher 拉动；
+- pure OPD 下整个 policy term 最后可能被置零，但额外计算已经发生。
+
+当你明确要混合 RLVR + OPD 时，才打开 `use_task_rewards=true`，并独立记录两项 loss 与验证 reward。
+
+## Sync 与 async 的配置路线
+
+### 第一次实验
+
+```yaml
+trainer:
+  use_v1: true
+  v1:
+    trainer_mode: sync
+```
+
+这是当前默认，也是排查 token/mask/loss 最清楚的模式。
+
+### 吞吐优化之后再做
+
+V1 还提供：
+
+```yaml
+trainer.v1.trainer_mode: colocate_async | separate_async
+trainer.v1.sampler.max_off_policy_threshold: 8
+trainer.v1.sampler.max_off_policy_strategy: drop | wait
+```
+
+配置定义见 [`ppo_trainer.yaml` L203–247](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/config/ppo_trainer.yaml#L203-L247)。先建立 sync 数值 baseline，再逐个改变 warmup、parameter-sync step、staleness threshold；否则吞吐变化与算法变化无法归因。
+
+## 启动前 checklist
+
+### 数据
+
+- [ ] parquet/schema 能被当前 RL dataset 读取；
+- [ ] `prompt`、`data_source`、image key 与 reward 字段存在；
+- [ ] MOPD key 与 teacher key 完全匹配；
+- [ ] 多数据集启用 shuffle；
+- [ ] max prompt/response 与过滤策略明确。
+
+### 模型与 tokenizer
+
+- [ ] student/teacher revisions 固定；
+- [ ] tokenizer vocab 与 id→token 映射兼容；
+- [ ] BOS/EOS/PAD、chat template 相同；
+- [ ] 多模态 processor 与 placeholders 兼容；
+- [ ] teacher temperature 显式为 1.0。
+
+### 资源
+
+- [ ] global pool + teacher pool GPU 总数不超过 Ray cluster；
+- [ ] teacher pool 精确等于 replicas × TP × DP × PP 之和；
+- [ ] 每个 replica 连续 bundle 与节点边界对齐；
+- [ ] rollout/teacher `gpu_memory_utilization` 留有余量；
+- [ ] `max_model_len >= prompt + response + 1`。
+
+### Loss
+
+- [ ] `k1 + PG` 或 `forward_kl_topk + direct`；
+- [ ] pure OPD 关闭标准 reference KL；
+- [ ] task+OPD 时记录 `distillation_loss_coef`；
+- [ ] top-k 时 K 与 vLLM `max_logprobs` 一致；
+- [ ] 普通 FSDP/Megatron top-k 没有误开 fused。
+
+### 可复现性
+
+- [ ] 记录 verl commit、容器、torch/CUDA、vLLM/SGLang 版本；
+- [ ] 记录所有 Hydra overrides；
+- [ ] 先用 `trainer.logger=console`；
+- [ ] smoke test 关闭或降低 save/test 频率；
+- [ ] 保留完整启动配置打印和首个 step 指标。
+
+## 启动后前十分钟看什么
+
+| 观察 | 正常信号 | 异常提示 |
+|---|---|---|
+| teacher servers | replicas 全部注册，请求能返回 | 长时间 0 请求、route error、context error |
+| `actor/distillation/loss` | 有限、非 NaN；same-model 时接近 0 | 缺字段、爆大、固定不变 |
+| `grad_norm` | 有限且非 0 | 0、NaN/Inf |
+| response mask | 每批有效 token 大于 0 | 全 0 或 tool token 误标 1 |
+| top-k `teacher_mass` | 随 K 增大通常上升 | 很低且固定，K/状态/teacher 需查 |
+| `student_mass` | 能反映 student 对 teacher support 的覆盖 | ids 错位时可能异常低或 gather 报错 |
+| `overlap_ratio` | 作为诊断趋势看 | 不能单独当训练目标或质量分数 |
+| throughput/timing | teacher、rollout、update 都有活动 | teacher wait 或 weight sync 独占 |
+
+## 下一步
+
+<Cards>
+  <Card title="按症状排错" href="/docs/engineering/debugging">
+    把启动错误、OOM、loss 异常与指标映射到具体源码路径。
+  </Card>
+  <Card title="第一次最小实验" href="/docs/practice/first-run">
+    使用 same-model baseline、实验记录表和升级路线。
+  </Card>
+  <Card title="回到架构图" href="/docs/engineering/verl-architecture">
+    再确认每个配置控制的是哪个角色与资源池。
+  </Card>
+</Cards>

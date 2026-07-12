@@ -1,0 +1,81 @@
+---
+title: 选择 teacher 与 prompt
+description: 强老师不一定是好老师；用兼容性、新知识、tokenizer 与 prompt 分布做一次开跑前体检。
+---
+
+“teacher 越强越好”是最容易让 OPD 实验烧掉算力的误区。一个教师可以在 benchmark 上高很多，却在学生实际访问的 prefix 上给不出可利用的局部梯度；另一个教师与学生很相似，但没有带来学生未见的新能力，也可能几乎没有增益。
+
+<Callout title="先记住两个问题">
+  **它在学生状态上会不会教？它有没有学生尚未学到的东西？** 前者关乎局部兼容性，后者关乎信息增量。两者都不能只由模型参数量或最终分数代替。
+</Callout>
+
+## 选择 teacher 的四层检查
+
+### 1. 接口必须对得上
+
+先检查最朴素但最致命的工程条件：
+
+- teacher 与 student 是否共享 tokenizer 与 vocabulary id；
+- chat template 是否一致，system/user/assistant 边界是否相同；
+- BOS、EOS、padding 与特殊 token 是否进入了同一位置；
+- teacher scoring 是否看到**完整相同的 prompt + 学生 response prefix**；
+- temperature 的定义是否一致，log-prob 是原始 logits 还是温度缩放后 logits。
+
+[Revisiting OPD](https://arxiv.org/abs/2603.25562v2) 特别讨论了 tokenizer/特殊 token 不匹配与学生 prefix 上 teacher guidance 不可靠的问题。它们不是“实现小节”，而是会直接改变训练目标。
+
+### 2. 局部候选是否有交集
+
+[Rethinking OPD](https://arxiv.org/abs/2604.13016) 用 student 与 teacher 的 top-k token overlap 等动态指标刻画 thinking-pattern compatibility。论文在其成功设置中观察到：共享高概率 token 集承载了绝大部分概率质量，并随训练逐步对齐；失败设置则从一开始就表现为 overlap 停滞与 entropy gap 持续存在。
+
+这不意味着存在跨模型通用的“合格 overlap 阈值”。正确做法是：在一小批真实 prompt 上，以**与你正式训练相同的采样与模板**做 probe，比较候选集、entropy 与位置趋势。
+
+### 3. 教师是否真的带来新能力
+
+benchmark 更高不等于对 student 有新信息。若 teacher 与 student 经历高度相同的数据和后训练 recipe，它们可能只是在规模上不同，却从学生视角呈现相似分布。建议加入三个 probe：
+
+1. teacher 能否解决 student 稳定失败、且不只是格式问题的样本；
+2. teacher 在这些样本的学生 prefix 上，是否给出稳定而非剧烈跳变的局部偏好；
+3. 小规模 OPD 后，能力提升是否超出同预算 SFT / continued pretraining 对照。
+
+### 4. 成本是否允许它持续“在线教学”
+
+teacher 选择还受系统约束：
+
+| 选择 | 好处 | 隐性成本 |
+| --- | --- | --- |
+| sampled-token log-prob | 通信小、recipe 简单 | 单位置方差较高，无法直接观察完整支持集 |
+| teacher top-k | 可看局部候选，便于可靠支持集 | 需要索引+分数通信，截断/归一化口径要一致 |
+| full vocabulary | 给定 prefix 上信号最完整 | `B × T × |V|` 的激活、显存与带宽压力 |
+| black-box teacher | 不需要 logits 访问 | 必须换成 rubric、verbal feedback、discriminator 等不同目标 |
+
+不要把只能提供文本 API 的教师写进需要 logits 的配置，然后期待框架自动补齐监督。
+
+## prompt pool 不是中性的
+
+prompt 决定学生会访问哪些状态，也决定教师的局部知识有没有机会出现。
+
+- **学生部署分布 prompt**：最贴近最终使用，但可能远离 teacher 熟悉的后训练分布；
+- **teacher-aligned prompt**：Rethinking OPD 在其设置中发现可增强对齐，但也观察到学生 entropy 明显降低，因此建议与分布外 prompt 混合；
+- **课程式 prompt**：先短后长、先确定性后开放性，有助于逐步扩大状态覆盖；
+- **只保留 teacher 正确样本**：可能提高信号平均质量，却也改变任务分布并掩盖 teacher 的失效区域。
+
+<CompatibilityLab />
+
+## cold start 什么时候有意义
+
+如果 teacher 与 student 局部候选严重错开，直接 OPD 可能无法跨过初始几何距离。[Rethinking OPD](https://arxiv.org/abs/2604.13016) 的一种修复是先对 teacher-generated rollout 做短暂 off-policy SFT，再切回学生 rollout 的 OPD。
+
+请把它理解为“把学生带进老师会教的区域”，不是把 OPD 永久改成 SFT。切换后仍要确认 rollout 确实来自更新后的 student，并监控是否只是在复制 teacher 格式。
+
+## 一张可执行的开跑卡
+
+- [ ] tokenizer/vocab/chat template/special token 已逐项一致；
+- [ ] 用真实解码配置做过 student rollout probe；
+- [ ] teacher 在 student prefix 上的 log-prob、top-k 与 entropy 已抽查；
+- [ ] 有“teacher 新能力”样本集，而不只看总 benchmark；
+- [ ] prompt pool 的来源、去重、长度与领域比例有记录；
+- [ ] 设有 SFT、off-policy KD 或无蒸馏的等预算对照；
+- [ ] 先做短序列、小 batch、小步数的 smoke test；
+- [ ] 训练会按位置记录 KL/log-ratio、entropy、overlap 与有效 token 数。
+
+下一步：进入 [第一次可信试跑](/docs/practice/first-run)，或者先读 [失败模式与修复](/docs/frontier/failure-recipes)。

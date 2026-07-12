@@ -1,0 +1,200 @@
+---
+title: 先建立正确心智模型
+description: 用“学生先作答、教师沿学生前缀逐步点评”的主线，分清状态、目标、估计器与更新器。
+---
+
+<Callout type="info" title="先记住这一句话">
+  **OPD 让学生先走自己的路，再让教师在学生真正到达的每个前缀上给 next-token 反馈。**“On-policy”描述的是训练状态从哪里来，不规定必须使用哪一种 KL，也不保证教师在这些状态上一定会教。
+</Callout>
+
+## 一幅不容易忘的图
+
+把语言模型想成一个正在解题的学生。
+
+```text
+题目 x
+  │
+  ▼
+当前学生逐 token 生成：y₁ → y₂ → y₃ → …
+                         │     │
+                         └──┬──┘
+                            ▼
+教师读取同一条学生前缀，给出“下一步我会怎么选”的分布
+                            │
+                            ▼
+比较学生与教师 → 得到逐 token 信号 → 更新学生
+```
+
+教师不是替学生写一份标准答案。它评阅的是学生已经写出的前缀，包括不自然的表达、绕路和早先犯下的错误。下一轮再由更新后的学生重新生成，所以训练状态会随学生一起变化。
+
+这正是 OPD 与普通离线蒸馏最关键的差别。
+
+## 把生成翻译成“策略与状态”
+
+给定 prompt $x$，学生生成回答
+
+$$
+y=(y_1,y_2,\ldots,y_T)\sim \pi_\theta(\cdot\mid x).
+$$
+
+在位置 $t$：
+
+| 术语 | 在语言模型中是什么 |
+|---|---|
+| 状态 $s_t$ | prompt 加学生已生成的前缀 $(x,y_{1:t-1})$ |
+| 动作 $y_t$ | 当前选择的下一个 token |
+| 学生策略 $p_t$ | $\pi_\theta(\cdot\mid s_t)$ |
+| 教师策略 $q_t$ | $\pi_T(\cdot\mid s_t)$ |
+| rollout / trajectory | 从 prompt 到 EOS 或截断位置的一次生成 |
+
+一个 token 会成为下一步状态的一部分。因此，学生早期走偏后，教师看到的也不再是自己平常会生成的前缀。这带来 OPD 的两面性：
+
+- 好处：训练覆盖学生部署时会遇到的真实错误状态；
+- 风险：教师在很陌生的学生前缀上，未必仍能给出可靠、可利用的局部指导。
+
+## 一轮 OPD 只做五件事
+
+1. 从 prompts 取一批问题；
+2. 用当前学生采样 rollouts；
+3. 在每个学生前缀上计算学生和教师的 next-token 信息；
+4. 把分布差异变成 loss 或 advantage；
+5. 更新学生，然后重新采样下一批状态。
+
+最常见的 sampled-token 信号是：对学生实际采到的 $y_t$，计算
+
+$$
+A_t=\log q_t(y_t)-\log p_t(y_t).
+$$
+
+- $A_t>0$：教师比学生更偏爱这个 token，更新倾向于提高它的概率；
+- $A_t<0$：学生对它比教师更自信，更新倾向于压低它的概率；
+- $A_t\approx0$：两者在这个采样动作上的判断接近。
+
+这只是一个采样 token 的局部信号。真正的 reverse KL 是对学生分布取期望；有限 batch 中，单个 $A_t$ 既不必为正，也不能单独代表整步 KL。
+
+## 四层必须分开想
+
+初学 OPD 最容易把四件不同的事都叫作“KL 训练”。以后看到任何实现，按下面四层拆开：
+
+| 层 | 它回答的问题 | 常见选择 |
+|---|---|---|
+| 1. 状态来源 | 在谁生成的前缀上教？ | 固定数据、教师轨迹、当前学生轨迹、on/off-policy 混合 |
+| 2. 数学目标 | 同一前缀上的两个分布怎样靠近？ | forward KL、reverse KL、JSD、中间目标 |
+| 3. 监督粒度 | 教师返回多少词表信息？ | 一个采样 token、完整词表、截断 top-k |
+| 4. 更新器 | 如何把信号变成参数梯度？ | 交叉熵、policy gradient、importance sampling、PPO-style clipping |
+
+<Callout type="warn" title="On-policy 不等于 Reverse KL">
+  GKD 同时把 rollout 来源和 divergence 当作独立旋钮：学生轨迹上也可以算 forward KL 或 JSD。Thinking Machines 的基础 recipe 选择“学生 rollout + sampled-token reverse-KL signal + importance-sampling update”，它是一种具体实现，不是 OPD 的唯一数学定义。
+</Callout>
+
+## OPD、SFT 与 RL 各自补哪块短板
+
+| 方法 | 谁产生训练轨迹 | 反馈通常有多密 | 最擅长解决什么 |
+|---|---|---:|---|
+| SFT / 离线蒸馏 | 人类、固定数据或教师 | 每 token | 把新知识、格式和基本解题模式放进学生的有效支持集 |
+| 结果奖励 RL | 当前学生 | 每条轨迹一个或少量信号 | 直接优化可验证结果，允许搜索新策略 |
+| OPD | 当前学生 | 每 token 或局部词表 | 在学生实际访问的状态上贴近教师、练习错误恢复 |
+
+Thinking Machines 用“下棋”类比：SFT 像看大师棋谱，结果奖励 RL 像自己下完才看输赢，OPD 则像大师逐步点评你自己的棋局。这个类比很有用，但不要忘记：模型教师不是全知裁判，它也可能误判陌生局面。
+
+## OPD 能教什么，不能凭空创造什么
+
+### 更适合 OPD 的情况
+
+- 学生已有领域知识和基本格式，却经常在自己的推理路径上走偏；
+- 可以访问教师在给定前缀上的 log-prob 或 logits；
+- 希望得到比结果奖励更密集的反馈；
+- 部署时的学生状态与固定教师数据差距较大。
+
+### 先做 SFT、数据补充或 mid-training 的情况
+
+- 学生几乎不会生成目标语言、工具调用语法或关键概念；
+- 目标行为在学生采样分布中的概率低到现实 batch 几乎见不到；
+- 教师和学生 tokenizer 无法直接对齐，又没有跨 tokenizer 的事件映射；
+- 只有黑盒教师文本，没有 token 概率接口，且也没有另行设计的 outcome / discriminator 信号。
+
+Softmax 在数学上可能给每个 token 非零概率，但“非零”不等于有限训练预算内采得到。On-policy reverse-KL 尤其擅长在学生已经能到达的区域内重排概率，并不天然把从未出现的新行为搬进来。
+
+## 一篇机制论文给出的重要提醒
+
+[Rethinking On-Policy Distillation](https://arxiv.org/abs/2604.13016) 在其数学推理实验中提出两个经验条件：
+
+1. teacher 与 student 的 **thinking pattern 要足够兼容**；
+2. teacher 还要带来 student 训练中没有见过的能力或信息，而不只是 benchmark 分数更高。
+
+论文把 top-k token overlap 当作局部兼容性的一个观测量，并在成功配置中观察到共享高概率 token 的渐进对齐。它还用 off-policy cold start 与 teacher-aligned prompts 恢复了论文中的部分失败配置。
+
+这些是该论文模型对、数据集和训练配方下的实验观察，不是“同家族一定兼容”“overlap 高就一定成功”或“先 SFT 必然解决一切”的定律。尤其是 benchmark 更强，只能说明教师最终答题更好，不能证明它在学生每一个陌生前缀上的 next-token 梯度都可利用。
+
+## 读训练日志时，脑中同时放三条时间线
+
+```text
+token 位置：   前缀越来越深，早期错误会改变后续状态
+训练 step：    学生分布在变，下一批 on-policy 状态也在变
+系统时钟：     sampler、learner、teacher 可能异步，策略可能略有陈旧
+```
+
+所以“loss 降了”可能只代表当前采样 token 的拟合变好。你还要问：
+
+- held-out 任务指标是否提高？
+- 学生与教师是在同一文本前缀、同一 token 位置上评分吗？
+- rollout 温度和截断是否改变了被解释的分布？
+- 后半段 token 的熵、梯度范数或 overlap 是否开始恶化？
+- sampler 与 learner 的版本差距有没有被 importance ratio 正确处理？
+
+## 你的第一张 OPD 检查卡
+
+遇到一篇论文或一段代码，按顺序回答：
+
+1. **谁生成状态？** 当前学生、旧学生、教师还是固定数据？
+2. **教师看见什么？** 是否与学生完全相同的 prompt、chat template 和前缀？
+3. **比较什么分布？** $D(q\|p)$、$D(p\|q)$、JSD，还是只比较一个 token？
+4. **教师返回什么？** 单 token log-prob、top-k，还是完整 logits？
+5. **如何更新？** 直接反传、policy gradient、importance sampling 还是 clipping？
+6. **哪些 token 有效？** prompt、padding、特殊 token、EOS 是否正确 mask？
+7. **成功凭什么判断？** 任务指标、分布指标、稳定性和成本是否同时报告？
+
+如果这七问能答清楚，你已经不会被“都是 OPD”这句话带偏。
+
+## 小测：你真的分清了吗？
+
+<details>
+<summary>学生生成轨迹、教师返回完整 logits，这算 on-policy 吗？</summary>
+
+算。on-policy 由状态来源决定；完整 logits 只描述监督粒度。
+
+</details>
+
+<details>
+<summary>教师生成轨迹、训练时使用 reverse KL，这算 OPD 吗？</summary>
+
+通常应称 off-policy reverse-KL distillation，因为训练前缀来自教师而不是当前学生。KL 方向不能改变状态来源。
+
+</details>
+
+<details>
+<summary>更强的教师是否一定带来更好的 OPD？</summary>
+
+不一定。教师既要有可迁移的新能力，也要能在学生访问的状态上提供可利用的局部信号；总体 benchmark 分数不能单独保证这两点。
+
+</details>
+
+<Cards>
+  <Card title="下一步：需要哪些预备知识" href="/docs/start/prerequisites">
+    用一页补齐 token、log-prob、KL、Monte Carlo 与 policy gradient。
+  </Card>
+  <Card title="推导 OPD 目标" href="/docs/core/objective">
+    从序列 reverse KL 推到 token 分解，再区分数值估计与梯度更新。
+  </Card>
+  <Card title="比较 sampled / full / top-k" href="/docs/core/granularity">
+    看清三种监督粒度的精确性、方差和系统成本。
+  </Card>
+</Cards>
+
+## 一手资料
+
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [GKD / On-Policy Distillation of Language Models](https://arxiv.org/abs/2306.13649)
+- [Rethinking On-Policy Distillation](https://arxiv.org/abs/2604.13016)
+- [Tinker Cookbook — Distillation recipes](https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation)
+- [verl — OPD documentation](https://verl.readthedocs.io/en/latest/algo/opd.html)

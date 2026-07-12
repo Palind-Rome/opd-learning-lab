@@ -1,0 +1,354 @@
+---
+title: OPD 的目标：从整条序列到每个 token
+description: 推导 sequence-level reverse KL 的精确分解，并分清目标值、采样估计、policy-gradient surrogate 与时间信用分配。
+---
+
+<Callout type="warn" title="本章最重要的边界">
+  **“一个采样 token 的 log-ratio 无偏估计了该前缀上的 KL 数值”**，不等于**“对这个标量直接反传就自动得到完整序列目标的无偏梯度”**。目标、数值估计器、梯度估计器和时间信用分配是四件事。
+</Callout>
+
+## 1. 记号：教师必须读取学生的同一个前缀
+
+给定 prompt $x$，学生策略为 $\pi_\theta$，冻结教师为 $\pi_T$。学生采样：
+
+$$
+y=(y_1,\ldots,y_T)\sim \pi_\theta(\cdot\mid x).
+$$
+
+在学生访问的状态
+
+$$
+s_t=(x,y_{1:t-1})
+$$
+
+上，定义
+
+$$
+p_t(v)=\pi_\theta(v\mid s_t),
+\qquad
+q_t(v)=\pi_T(v\mid s_t).
+$$
+
+注意，$s_t$ 是**学生前缀**。教师只做条件概率评估，不必认可或自然地产生这条前缀。若教师改为读取自己的前缀，$p_t$ 与 $q_t$ 就不再是在同一状态上的分布比较。
+
+本章先假设两者共享可直接对齐的 tokenizer 与词表 $V$。跨 tokenizer 时，“同一个 token 事件”的定义需要额外映射，不能直接按 token id 算 KL。
+
+## 2. 序列级 Reverse KL
+
+对固定 prompt，一个标准目标是：
+
+$$
+J_x(\theta)
+=D_{\mathrm{KL}}
+\left(
+\pi_\theta(\cdot\mid x)
+\,\middle\|\,
+\pi_T(\cdot\mid x)
+\right).
+$$
+
+展开定义：
+
+$$
+J_x(\theta)
+=\mathbb E_{y\sim\pi_\theta(\cdot\mid x)}
+\left[
+\log\pi_\theta(y\mid x)-\log\pi_T(y\mid x)
+\right].
+$$
+
+再利用自回归分解：
+
+$$
+\log\frac{\pi_\theta(y\mid x)}{\pi_T(y\mid x)}
+=\sum_{t=1}^{T}
+\log\frac{p_t(y_t)}{q_t(y_t)}.
+$$
+
+于是：
+
+$$
+J_x(\theta)
+=\mathbb E_{y\sim\pi_\theta}
+\left[
+\sum_{t=1}^{T}
+\log\frac{p_t(y_t)}{q_t(y_t)}
+\right].
+$$
+
+对每个学生前缀再对 $y_t\sim p_t$ 取条件期望，就得到 KL 的链式分解：
+
+$$
+J_x(\theta)
+=\mathbb E_{y\sim\pi_\theta}
+\left[
+\sum_{t=1}^{T}
+D_{\mathrm{KL}}(p_t\|q_t)
+\right].
+$$
+
+这就是“序列 reverse KL 可以精确拆成学生访问状态上的 token-level reverse KL”的来源。[Rethinking OPD §2.2](https://arxiv.org/pdf/2604.13016) 用它统一 sampled、full-vocabulary 与 top-k 三种粒度。
+
+### 一个容易漏掉的前提：终止也是分布的一部分
+
+严格的变长序列分布包含 EOS。实现中通常：
+
+- 从第一个 response token 计分；
+- 计入有效 EOS；
+- 屏蔽 prompt 与 padding；
+- EOS 后的位置不再计分。
+
+若强制在 `max_response_length` 截断，训练的是截断生成过程上的目标，而不是自动等同于完整回答分布的 KL。按 token 求均值也会让长短轨迹的相对权重不同于“每条序列先求和再平均”。这两种工程选择都应明确记录。
+
+## 3. 固定前缀上的三种“同一目标”视图
+
+暂时把状态 $s_t$ 固定，reverse KL 是：
+
+$$
+K_t
+=D_{\mathrm{KL}}(p_t\|q_t)
+=\sum_{v\in V}p_t(v)
+\left[\log p_t(v)-\log q_t(v)\right].
+$$
+
+它有两种等价的精确写法：
+
+$$
+K_t
+=\mathbb E_{v\sim p_t}
+\left[\log p_t(v)-\log q_t(v)\right].
+$$
+
+- 枚举 $V$：得到完整词表的精确条件 KL；
+- 从 $p_t$ 采样：得到它的 Monte Carlo 估计。
+
+若只在某个 top-k 子集上重归一化后求 KL，就换成了**截断近似目标**，不再与完整词表 KL 精确相等。下一章会详细比较。
+
+## 4. sampled token 对 KL 数值何时无偏
+
+若学生实际采到
+
+$$
+y_t\sim p_t,
+$$
+
+定义
+
+$$
+\widehat K_t
+=\log p_t(y_t)-\log q_t(y_t),
+$$
+
+那么
+
+$$
+\mathbb E_{y_t\sim p_t}[\widehat K_t]
+=D_{\mathrm{KL}}(p_t\|q_t).
+$$
+
+这是对**固定前缀上的 KL 数值**无偏。成立需要：
+
+1. token 确实从分子里的 $p_t$ 采样；
+2. $p_t$、$q_t$ 在同一文本前缀与同一 token 事件上评分；
+3. 没有把温度 / top-p 后的采样分布与原始模型分布混写；
+4. mask、right shift 与 EOS 对齐。
+
+一次采样方差可能很大。单 token 的 $\widehat K_t$ 可以为负；KL 的非负性只属于完整期望。
+
+## 5. 从数值估计走到可训练的梯度
+
+固定状态上，教师冻结。对 $K_t$ 求导：
+
+$$
+\begin{aligned}
+\nabla_\theta K_t
+&=\nabla_\theta
+\sum_v p_t(v)\log\frac{p_t(v)}{q_t(v)}\\
+&=\mathbb E_{v\sim p_t}
+\left[
+\left(
+\log p_t(v)-\log q_t(v)+1
+\right)
+\nabla_\theta\log p_t(v)
+\right].
+\end{aligned}
+$$
+
+利用
+
+$$
+\mathbb E_{v\sim p_t}
+[\nabla_\theta\log p_t(v)]=0,
+$$
+
+常数 $+1$ 可以去掉：
+
+$$
+\nabla_\theta K_t
+=\mathbb E_{v\sim p_t}
+\left[
+\left(\log p_t(v)-\log q_t(v)\right)
+\nabla_\theta\log p_t(v)
+\right].
+$$
+
+令停止梯度的 advantage 为
+
+$$
+A_t
+=\operatorname{sg}
+\left[
+\log q_t(y_t)-\log p_{\text{sample},t}(y_t)
+\right],
+$$
+
+再最小化 policy-gradient surrogate：
+
+$$
+\mathcal L_{\text{PG},t}
+=-A_t\log p_{\text{learner},t}(y_t),
+$$
+
+就能在 sampler 与 learner 相同时估计固定状态上的 reverse-KL 梯度。`sg` 表示构造 advantage 时停止梯度。
+
+<Callout type="warn" title="不要对缓存的 sampled log-prob 直接 backward">
+  缓存的 sampler log-prob 用来定义采样分布和 advantage；真正承载梯度的是 learner 对相同 token 重新计算的 log-prob，或等价的 importance-sampling surrogate。
+</Callout>
+
+## 6. sampler 与 learner 不同时：importance ratio
+
+在线系统常先由 sampler 生成，再让 learner 做一个或多个更新。此时可写：
+
+$$
+\rho_t(\theta)
+=\frac{p_{\text{learner},t}(y_t)}
+{p_{\text{sample},t}(y_t)}.
+$$
+
+一个常见 surrogate 是：
+
+$$
+\mathcal L_{\text{IS}}
+=-\mathbb E_{y_t\sim p_{\text{sample},t}}
+[\rho_t(\theta)A_t].
+$$
+
+这里有两个不要混淆的 ratio：
+
+| ratio | 角色 |
+|---|---|
+| $\log p_{\text{sample}}-\log q_T$ | 教师监督，构造 reverse-KL advantage |
+| $p_{\text{learner}}/p_{\text{sample}}$ | 修正 learner 与 sampler 的策略版本差异 |
+
+若对 $\rho_t$ clipping，目标会换成带偏但更稳的 surrogate；它不再是“原 KL 梯度的原封不动实现”。PPO 的价值就在于理解这种稳定性—偏差权衡，而不是把 PPO 与 OPD 画等号。
+
+## 7. 精确的值分解，不自动解决时间信用分配
+
+链式分解
+
+$$
+J_x=\mathbb E_{y\sim\pi_\theta}
+\left[\sum_t K_t(s_t)\right]
+$$
+
+在**目标值**上是精确的。但状态 $s_t$ 来自学生，因而它的分布也依赖 $\theta$。早期 token 会改变后面访问哪些状态。
+
+若要对完整 trajectory KL 求严格的 score-function 梯度，早期动作还应为后续 KL 项负责，形式上会出现 return-to-go：
+
+$$
+G_t
+=\sum_{u=t}^{T}
+\left[
+\log p_u(y_u)-\log q_u(y_u)
+\right].
+$$
+
+而许多实际 recipe 使用**即时信号**：位置 $t$ 只接收自身 log-ratio，相当于把本轮采到的状态当作局部训练数据，下一轮再重新采样。这是可用的 on-policy surrogate，但没有显式包含所有未来状态分布导数。
+
+Thinking Machines 的 recipe 提供 `kl_discount_factor`，默认设为 0，即只用即时 KL；文章报告在其设置中正折扣没有带来改善。这是具体实验选择，不表示长时域 credit assignment 在数学上不存在。[Thinking Machines — Loss function](https://thinkingmachines.ai/blog/on-policy-distillation/)
+
+## 8. Full-vocabulary 反传解决什么，没解决什么
+
+在一个已采样且视为固定的状态上，直接计算
+
+$$
+K_t=\sum_v p_t(v)(\log p_t(v)-\log q_t(v))
+$$
+
+并反传，会得到该状态上**精确、低方差的条件 KL 梯度**。它不需要从词表再采一个动作来估计 conditional KL。
+
+但 rollout 状态本身仍由离散采样产生。普通反传不会穿过早先的 token 选择，所以“full vocabulary”不自动等于“完整序列 KL 的所有状态分布梯度都被精确计算”。它主要解决的是 vocabulary 维度的估计，不是 temporal credit 维度。
+
+## 9. Forward KL 与 JSD 也可以用在学生状态上
+
+On-policy 只约束 $s_t$ 来自学生。给定这些状态，完全可以优化：
+
+$$
+D_{\mathrm{KL}}(q_t\|p_t)
+$$
+
+或 generalized JSD。GKD 把 rollout mixture $\lambda$ 与 divergence $D$ 分开控制，明确展示了二者是独立轴。[GKD](https://arxiv.org/abs/2306.13649)
+
+需要注意：在学生访问状态上求局部 forward KL，不应未经说明就称为完整 teacher-sequence distribution 对 student-sequence distribution 的 forward KL。两者的状态分布不同。
+
+## 10. 一个可执行的目标规格
+
+在写代码前，先把实验目标写成下面这张卡：
+
+```text
+prompt distribution:          D_x = ...
+rollout behavior policy:      current student / stale student
+sampling transform:           temperature=?, top_p=?, top_k=?
+state:                        exact student text prefix
+divergence:                   RKL / FKL / JSD
+vocabulary estimator:         sampled / full / subset
+temporal credit:              immediate / discounted / return-to-go
+learner correction:           none / IS / clipped IS
+token reduction:              sum-per-sequence / mean-per-token
+valid mask:                   response through EOS; no prompt/pad
+```
+
+缺少其中任何一项，“我们用了 OPD loss”都还不是一个可复现的算法描述。
+
+## 11. 自测
+
+<details>
+<summary>为什么 sampled log-ratio 可以估计 KL 值，却不能只把它当普通可微标量？</summary>
+
+因为样本来自依赖 $\theta$ 的学生分布。缓存 token 与旧 log-prob 后，采样操作不可普通反传；需要 score-function / policy-gradient surrogate，或在完整词表上直接构造可微条件 KL。
+
+</details>
+
+<details>
+<summary>full-vocabulary loss 是否解决了所有“精确性”问题？</summary>
+
+没有。它精确枚举固定状态上的词表维度，但学生访问哪些状态仍由离散 rollout 决定；若关心完整序列目标的梯度，还涉及未来状态的时间信用分配。
+
+</details>
+
+<details>
+<summary>按 token 平均与按序列求和等价吗？</summary>
+
+通常不等价。按 token 平均让每个有效 token 权重接近相同；按序列先求和会让长轨迹贡献更大。必须明确 reduction 与长度截断。
+
+</details>
+
+<Cards>
+  <Card title="比较三种监督粒度" href="/docs/core/granularity">
+    sampled、full-vocabulary 与 top-k 在精度、方差和通信上各自交换了什么。
+  </Card>
+  <Card title="看 Tinker 的真实实现" href="/docs/engineering/tinker-cookbook">
+    沿源码追踪 sampled log-prob、teacher log-prob、advantage 与 importance ratio。
+  </Card>
+  <Card title="补 PPO 桥梁" href="/docs/foundations/ppo-bridge">
+    理解旧策略、ratio、clipping 和 mini-batch 更新，但不要把 PPO 当成 OPD 本身。
+  </Card>
+</Cards>
+
+## 一手资料
+
+- [Rethinking OPD — §2.2](https://arxiv.org/abs/2604.13016)
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [Tinker Cookbook — Distillation](https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation)
+- [GKD / On-Policy Distillation of Language Models](https://arxiv.org/abs/2306.13649)
+- [verl — OPD documentation](https://verl.readthedocs.io/en/latest/algo/opd.html)

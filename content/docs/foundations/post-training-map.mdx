@@ -1,0 +1,335 @@
+---
+title: LLM Post-training 方法地图
+description: 从数据来源、监督信号和优化目标出发，对照 SFT、Off-policy KD、GKD/OPD 与 RLVR/PPO。
+---
+
+<Callout type="info" title="先看坐标轴，不急着背算法名">
+  一种 post-training 方法至少由四件事决定：谁生成 response、谁提供监督、信号落在 token 还是整条序列、最终优化什么目标。同一个工程系统可以按阶段组合多种方法。
+</Callout>
+
+面向推理模型时，常见路线不是“四选一”，而是一个栈：
+
+~~~text
+领域数据 / 教师轨迹
+      ↓
+SFT 或 Off-policy KD：先获得知识、格式和有效 support
+      ↓
+RLVR：搜索并强化能通过验证器的策略
+      ↓
+GKD / OPD：把强教师或 RL 后策略密集地蒸回学生
+~~~
+
+## 一张总表
+
+| 方法 | response / prefix 来源 | 监督信号 | 典型目标 | 主要优点 | 主要短板 |
+|---|---|---|---|---|---|
+| SFT | 人工、合成或固定数据 | 正确 target token | 最大化数据 response 的似然 | 简单稳定；能加入新知识与格式 | 状态分布固定；暴露偏差；有限样本会过拟合 |
+| Off-policy KD | 教师轨迹或固定 response | 教师 token 分布、top-k 或采样 token | 常为 forward KL / cross-entropy | 监督密集；教师数据可缓存；易于大规模训练 | 在教师/数据前缀上学习；学生犯错后缺少恢复经验 |
+| GKD / OPD | 当前学生 rollout，或与固定数据混合 | 教师在学生前缀上的 token 分布或 log-prob | FKL、RKL、JSD；Tinker 用 sampled-token RKL | 学生访问状态与训练状态匹配；监督密集 | 要持续 rollout 与 teacher scoring；依赖师生兼容和学生有效 support |
+| RLVR | 当前学生 rollout | 可验证结果奖励，如答案、测试或规则 | 最大化预期 reward | 直接优化任务成功；能搜索新策略 | 信号通常稀疏；样本与 credit assignment 成本高 |
+| PPO | 不是数据来源，而是一类 policy optimizer | 任意 advantage | clipped policy surrogate | 限制同批数据上过大更新；可多 epoch 利用 rollout | 需要可靠 advantage；常需 critic；clip 不会自动修复坏 reward |
+
+<Callout type="warn" title="PPO 与 RLVR 不在同一层">
+  RLVR 描述 reward 从哪里来——可验证结果；PPO 描述如何用 rollout 与 advantage 更新 policy。RLVR 可以用 PPO、GRPO 或别的 policy optimizer，OPD 也可以选择 PPO-style clipping。
+</Callout>
+
+## 轴 1：谁生成训练 response？
+
+### 固定数据：SFT 与 Off-policy KD
+
+训练 response 在优化前已经存在：
+
+$$
+(x,y)\sim\mathcal D.
+$$
+
+模型只在数据前缀 $y_{<t}$ 上学习。数据可以来自人工、教师采样、搜索或历史模型，但对当前学生而言都是 off-policy。
+
+优点是数据可检查、缓存和重复使用；缺点是学生部署时会生成自己的前缀，一次早期错误就可能进入训练集未覆盖的 state。
+
+### 当前学生：OPD 与 RL
+
+先从当前 policy 采样：
+
+$$
+\hat y\sim\pi_\theta(\cdot\mid x),
+$$
+
+再在 $\hat y_{<t}$ 上获取教师信号或环境 reward。训练直接覆盖学生会访问的状态，也必须持续承担在线采样成本。
+
+### 混合数据：GKD
+
+GKD 用 $\lambda$ 控制学生数据比例：
+
+$$
+\mathcal L_{\mathrm{GKD}}
+=(1-\lambda)\mathbb E_{(x,y)\sim\mathcal D}[D(q\|p_\theta)]
++\lambda\mathbb E_{x,\,\hat y\sim p_\theta}[D(q\|p_\theta)].
+$$
+
+- $\lambda=0$：完全固定数据；
+- $\lambda=1$：完全 on-policy；
+- 中间值：mixed。
+
+这说明 on-policy 不是某种 KL 的别名，而是 response / prefix 的来源。[GKD Algorithm 1](https://arxiv.org/pdf/2306.13649)
+
+## 轴 2：谁告诉学生“好不好”？
+
+### SFT：target token
+
+给定 target $y_t$：
+
+$$
+\mathcal L_{\mathrm{SFT}}
+=-\sum_t\log p_\theta(y_t\mid x,y_{<t}).
+$$
+
+监督是“这个位置应输出哪个 token”。若 target 是教师采样序列，样本期望对应教师交叉熵，但有限数据只看见教师分布的一部分。
+
+### KD / OPD：教师分布
+
+教师给出：
+
+$$
+q(\cdot\mid x,y_{<t}).
+$$
+
+可以使用完整词表 logits、top-k soft targets，或只查询学生采中 token 的 teacher log-prob。
+
+Tinker 基础 OPD 的逐 token 信号是：
+
+$$
+A_t=\log q_{\mathrm{teacher}}(\hat y_t)
+-\log p_{\mathrm{sample}}(\hat y_t).
+$$
+
+来源：[Thinking Machines OPD 实现说明](https://thinkingmachines.ai/blog/on-policy-distillation/)。
+
+### RLVR：验证器结果
+
+验证器通常只判断结果是否满足可检查条件，例如：
+
+- 数学最终答案匹配；
+- 代码通过单元测试；
+- 格式或约束检查通过；
+- 游戏或模拟环境达到目标。
+
+最简单的 reward：
+
+$$
+R(x,\hat y)\in\{0,1\}.
+$$
+
+它直接对应任务成功，但往往只在序列结束后出现。DeepSeek-R1 展示了通过大规模 RL 与规则/可验证奖励激发推理行为的路线；其优化器是 GRPO，不是 PPO，再次说明 reward 设计与 policy optimizer 是两层。[DeepSeek-R1](https://arxiv.org/abs/2501.12948)
+
+## 轴 3：优化的是模仿还是任务成功？
+
+| 目标 | 典型方法 | 最终吸引子 |
+|---|---|---|
+| 数据似然 | SFT | 训练数据的经验分布 |
+| 教师分布差异 | KD、GKD、OPD | 固定教师在相应状态上的行为 |
+| 环境预期回报 | RLVR | 验证器定义的高 reward 行为 |
+| 近端 policy surrogate | PPO | 在不过度偏离 rollout policy 的前提下提高给定 advantage |
+
+教师可能犯错，验证器也可能不完整：
+
+- KD 对教师忠实，不自动保证真实世界正确；
+- RLVR 对验证器忠实，不自动保证推理过程可读或分布外泛化；
+- PPO 只让更新更近端，不会把错误 reward 变正确。
+
+## SFT：先把能力放进学生的有效 Support
+
+### 适合做什么
+
+- 学习新领域知识；
+- 学会 chat template、工具调用格式；
+- 建立基本推理风格；
+- 为 RL 或 reverse-KL OPD 提供冷启动。
+
+### 为什么稳定
+
+每个 target token 都有明确交叉熵梯度，不需要在线采样、教师服务或 reward model。
+
+### 为什么会忘记或偏移
+
+有限 batch 对模型原分布只是有噪声的样本。Thinking Machines 的 personalization 实验显示，即便在模型自己的历史样本上继续 SFT，有限 batch 更新也可能逐步变成 off-policy 并损伤 instruction following。[博文 Continual learning](https://thinkingmachines.ai/blog/on-policy-distillation/)
+
+### 典型失败
+
+- train loss 降，部署长序列仍误差累积；
+- 数据模板过窄，模型只学到表面风格；
+- 大量领域训练导致原有 post-training 行为遗忘；
+- 新知识进入了模型，但没有被可靠调用。
+
+## Off-policy KD：在固定前缀上学教师
+
+Off-policy KD 比普通 hard-target SFT 多利用了教师分布信息。
+
+| 粒度 | 教师给什么 | 成本与信息 |
+|---|---|---|
+| sequence KD | 一条教师 response | 最易缓存，分布信息最少 |
+| top-k KD | 每位置若干 token 与概率 | 成本居中 |
+| full-logit KD | 完整词表分布 | 信息最全，显存与通信最贵 |
+
+优点是 teacher scoring 可离线完成、response 质量通常高，forward KL 还能覆盖教师多个 mode。短板是训练 state 来自数据/教师，不是学生部署时的前缀。GKD 正是为减轻这种 train–inference mismatch 而提出。[GKD Introduction 与 §3](https://arxiv.org/abs/2306.13649)
+
+## GKD / OPD：在学生自己的状态上学教师
+
+GKD 同时允许 fixed / mixed / on-policy 数据，以及 forward KL、reverse KL、generalized JSD。
+
+Thinking Machines 的 Tinker 基础 recipe 是更具体的组合：
+
+~~~text
+当前学生 rollout
+  + sampled-token reverse KL
+  + importance-sampling policy update
+  + 无 correctness / format reward
+~~~
+
+### 适合做什么
+
+- 学生已有领域能力，但在自己的推理路径上容易走偏；
+- 把昂贵 RL 搜索得到的最终策略蒸回更小模型；
+- mid-training 后恢复早期模型的 instruction-following；
+- 在不构造独立 reward model 时复用强教师。
+
+### 典型失败
+
+- 学生与教师 thinking pattern 不兼容；
+- 教师 benchmark 更强，却没有学生没见过的新能力；
+- 学生有效 support 太弱；
+- 长轨迹后部 prefix drift，teacher signal 下降；
+- entropy 过快坍缩或 response length 漂移。
+
+2026 年的系统研究观察到，成功 OPD 往往伴随 top-k overlap 上升、entropy gap 缩小；失败 run 则从早期停滞。作者提出 off-policy cold start 和 teacher-aligned prompts，但这些是其具体实验结论，不是通用保证。[Rethinking OPD](https://arxiv.org/abs/2604.13016)
+
+## RLVR：让验证器定义任务成功
+
+RL with Verifiable Rewards 的关键不是某个特定 loss，而是 reward 可自动检查。
+
+### 优点
+
+- 直接优化最终任务；
+- 不必把教师表达方式当成唯一答案；
+- policy 可能搜索到教师数据里没有的策略；
+- 验证器便宜时可大规模生成与筛选。
+
+### 短板
+
+- 结果 reward 稀疏，不知道哪一步导致成功；
+- 需要大量 rollout 搜索；
+- reward 覆盖不全时会产生捷径；
+- 全错/全对 group 可能没有相对 advantage；
+- 长回答让 credit assignment 更难。
+
+<Callout type="warn" title="可验证不等于完整">
+  单元测试通过只表示覆盖的测试通过；最终答案正确不表示推理过程可靠。必须用保留测试、分布外题目和行为审查补上验证器盲区。
+</Callout>
+
+## PPO：一种更新方式，不是一种知识来源
+
+PPO 从旧策略采样，使用：
+
+$$
+r_t(\theta)=
+\frac{\pi_\theta(a_t\mid s_t)}
+{\pi_{\mathrm{old}}(a_t\mid s_t)}
+$$
+
+与 clipped surrogate 限制同一批数据上的更新幅度。[PPO 原论文](https://arxiv.org/abs/1707.06347)
+
+PPO 不规定 advantage 来自哪里：
+
+- 可以来自 RLVR reward 与 value/GAE；
+- 可以来自偏好 reward model；
+- 也可以来自 OPD 的 teacher log-ratio。
+
+所以更准确的说法是“用 PPO 优化 RLVR reward”或“用 PPO-style clipping 优化 OPD advantage”，而不是“OPD 等于 PPO”。
+
+<Cards>
+  <Card title="PPO 与 OPD 逐项对照" href="/docs/foundations/ppo-bridge">
+    对齐 ratio、advantage、critic、clip 与两种不同的 KL。
+  </Card>
+  <Card title="最小 OPD 训练循环" href="/docs/core/training-loop">
+    看这些概念怎样变成 tensor 和伪代码。
+  </Card>
+  <Card title="训练指标仪表盘" href="/docs/practice/metrics">
+    联动诊断 KL、entropy、长度、overlap 与下游评测。
+  </Card>
+</Cards>
+
+## 怎么选：从当前瓶颈倒推
+
+### 学生完全不会某个领域或格式
+
+先选 SFT / off-policy KD，把知识与行为放进有效 support。
+
+### 学生会做，但常从自己的错误前缀越走越偏
+
+考虑 OPD，在学生访问状态上获得教师 dense signal。
+
+### 最终结果可自动验证，需要发现新策略
+
+考虑 RLVR。先确认验证器覆盖足够，并准备承担 rollout 搜索成本。
+
+### rollout 很贵，想重复利用同一批数据
+
+可考虑 PPO-style clipping 或其他 correction，同时监控新旧 policy ratio；优化器不会弥补低质量 reward。
+
+### 教师很强，OPD 却没有提升
+
+先检查：
+
+1. 师生 top-k overlap 与 entropy gap；
+2. 教师是否真的提供新增能力；
+3. 学生是否需要 off-policy cold start；
+4. prompt 是否和教师 post-training 分布相容；
+5. 后段 token 是否因 prefix drift 失去可靠信号。
+
+## 一个现实的混合配方
+
+~~~text
+1. SFT / Off-policy KD
+   学知识、格式、基本推理；建立有效 support
+
+2. RLVR
+   用验证器搜索并强化真正能解决任务的策略
+
+3. OPD
+   把 RL 后强策略的 dense token-level 信息传给学生
+
+4. 混合保持数据
+   防止领域能力、通用 chat 或安全行为回退
+
+5. 同设置评测
+   task success + 行为保持 + 长度/entropy/overlap
+~~~
+
+Thinking Machines 的 matched experiment 先用 RL 得到教师，再把最终策略 OPD 回相同初始化，体现了“RL 搜索、蒸馏传授”的分工。[Thinking Machines Discussion](https://thinkingmachines.ai/blog/on-policy-distillation/)
+
+## 自测
+
+1. RLVR 和 PPO 哪个描述 reward，哪个描述更新方式？
+2. on-policy + forward KL 是否成立？
+3. 为什么更强的教师不一定带来更好的 OPD？
+4. 学生完全不懂工具调用语法时，为什么应先 SFT？
+
+<details>
+<summary>查看答案</summary>
+
+1. RLVR 描述可验证 reward；PPO 描述 policy update。
+2. 成立。on-policy 决定前缀来源，forward KL 决定固定前缀上的分布目标。
+3. 师生 thinking pattern 可能不兼容，或教师没有学生未见的新能力。
+4. sampled-token reverse-KL OPD 主要从学生能采到的行为学习；SFT 先把格式放进有效 support。
+
+</details>
+
+## 一手资料
+
+- [Hinton et al. — Distilling the Knowledge in a Neural Network](https://arxiv.org/abs/1503.02531)
+- [GKD / On-Policy Distillation of Language Models](https://arxiv.org/abs/2306.13649)
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [Rethinking On-Policy Distillation](https://arxiv.org/abs/2604.13016)
+- [DeepSeek-R1](https://arxiv.org/abs/2501.12948)
+- [Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)
+

@@ -1,0 +1,351 @@
+---
+title: verl OPD 架构：谁在生成、谁在评分、谁在更新
+description: 以当前默认 V1 sync 路径为主线，读懂 Ray 角色、TransferQueue、teacher 服务与 actor/rollout 权重同步，并与 legacy、异步模式严格区分。
+---
+
+<Callout type="info" title="版本化阅读">
+  本章核验的是 verl 提交 <code>1ff76cc625e9820d2434dad1b6d9b8e5dd26a359</code>（2026-06-26）。源码链接都固定到该提交。verl 正在迁移 trainer；本文描述的是这个快照的真实默认路径，不保证未来目录和行号不变。
+</Callout>
+
+这一章先不钻进 KL 的每一行实现，而是回答四个系统问题：
+
+1. 一条 student rollout 在哪些进程之间流动？
+2. teacher 为什么是 inference server，而不是训练 worker？
+3. `teacher_logprobs`、`old_log_probs` 和 `advantages` 分别在什么时候出现？
+4. 文档里的 `ray_trainer.py`、当前 V1 trainer 和 fully async 到底是什么关系？
+
+如果你还不熟悉 state、rollout 与 token-level policy，先读：
+
+<Cards>
+  <Card title="为什么要 On-Policy？" href="/docs/foundations/why-on-policy">
+    先理解为什么训练状态必须来自学生自己的前缀。
+  </Card>
+  <Card title="KL 与蒸馏目标" href="/docs/foundations/kl-divergence">
+    分清 forward KL、reverse KL、top-k 近似与采样估计器。
+  </Card>
+  <Card title="PPO 是怎样接进来的？" href="/docs/foundations/ppo-bridge">
+    理解 old policy、importance ratio 和 clipping。
+  </Card>
+</Cards>
+
+## 先看一次 OPD 的五个交接点
+
+<OPDCycle />
+
+在 verl 中，这五步不是一个 Python 函数从头顺序执行到底。rollout、teacher inference、reward、actor forward/backward 分属不同 Ray actor；V1 trainer 用 TransferQueue 保存每条 trajectory 的中间字段，再由 controller 调度下一阶段。
+
+## 当前默认入口不是 legacy trainer
+
+官方示例都从下面的入口启动：
+
+```bash
+python3 -m verl.trainer.main_ppo ...
+```
+
+这个入口会读取 `trainer.use_v1`：
+
+```text
+main_ppo
+├─ trainer.use_v1 = true   ← 当前 YAML 默认
+│  └─ TaskRunnerV1
+│     └─ PPOTrainerSync    ← 当前 trainer_mode 默认
+│        └─ TransferQueue + AgentLoopWorkerTQ
+└─ trainer.use_v1 = false
+   └─ main_ppo_v0.TaskRunner
+      └─ RayPPOTrainer     ← deprecated 兼容路径
+```
+
+证据链：
+
+- [`ppo_trainer.yaml` L200–207](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/config/ppo_trainer.yaml#L200-L207)：`use_v1: true`、`trainer_mode: sync`；
+- [`main_ppo.py` L153–179](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/main_ppo.py#L153-L179)：V1/legacy 分流以及 legacy deprecation warning；
+- [`main_ppo_v0.py` L224–241](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/main_ppo_v0.py#L224-L241)：旧路径才直接构造 `RayPPOTrainer`。
+
+<Callout type="warn" title="为什么这条分界很重要">
+  verl 自带 <code>docs/algo/opd.md</code> 的架构段仍大量使用 <code>DataProto</code>、<code>RayPPOTrainer</code> 来叙述。那些组件仍存在，算法接线也相近，但在本快照默认配置下，训练数据实际经 <code>KVBatchMeta + TransferQueue</code> 流动。读代码时先确认 <code>trainer.use_v1</code>，否则很容易沿错调用链。
+</Callout>
+
+## 角色与资源池
+
+### 两个互不混用的 GPU 池
+
+V1 trainer 把资源分成：
+
+```text
+global_pool
+  ├─ Actor / ActorRolloutRef worker
+  ├─ student rollout replicas
+  ├─ optional reference policy
+  └─ optional critic
+
+teacher_pool
+  └─ one or more frozen teacher inference replicas
+```
+
+`global_pool` 的大小来自 `trainer.n_gpus_per_node × trainer.nnodes`；`teacher_pool` 来自 `distillation.n_gpus_per_node × distillation.nnodes`。创建逻辑见 [`trainer_base.py` L572–626](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_base.py#L572-L626)。
+
+这两个池需要的 GPU **相加**，不是二选一。teacher 不与 actor 共用同一批 bundle。
+
+### 角色表
+
+| 角色 | 代码对象 | 负责什么 | 是否训练 |
+|---|---|---|---:|
+| Controller | `PPOTrainerSync` | 编排 step、RPC、指标、checkpoint | 否 |
+| Agent loop | `AgentLoopWorkerTQ` | per-sample rollout、reward、teacher query、写队列 | 否 |
+| Student rollout | `LLMServerManager` 管理的 replicas | 用已同步的 student 权重生成 response | 否 |
+| Actor | `ActorRolloutRefWorker.actor` | 重算 logprob、计算 OPD/PPO loss、反向更新 | 是 |
+| Teacher | `TeacherModelManager` 的 replicas | 对 `prompt + student response` 返回 prompt logprobs | 否，冻结 |
+| Load balancer | `GlobalRequestLoadBalancer` | 把请求发给 in-flight 最少的 replica | 否 |
+| TransferQueue | `transfer_queue` | 保存 trajectory 的 jagged tensor 与 tag | 否 |
+
+角色枚举中 teacher 是独立的 `Role.TeacherModel`，见 [`ppo/utils.py` L27–55](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/utils.py#L27-L55)。
+
+## 初始化时发生了什么
+
+`TaskRunnerV1.run()` 的顺序是：初始化 TransferQueue，构造 trainer，执行 `trainer.init()`，创建 agent-loop manager，最后 `trainer.fit()`；见 [`main_ppo.py` L129–150](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/main_ppo.py#L129-L150)。
+
+`PPOTrainer._setup()` 再依次完成：
+
+1. tokenizer、dataset 与 dataloader；
+2. Ray resource pools 与 actor/critic worker groups；
+3. reward loop；
+4. OPD 开启时的 `MultiTeacherModelManager`；
+5. student rollout server manager；
+6. actor→rollout checkpoint/weight-sync manager。
+
+源码入口：[`trainer_base.py` L140–283](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_base.py#L140-L283)。
+
+### Actor 为什么自动换成 OPD loss
+
+trainer 构造 `ActorRolloutRefWorker` 时把顶层 `distillation` 配置传进去。worker 初始化 actor 后检查开关：
+
+```python
+if self.distillation_enabled:
+    self.loss_fn = partial(
+        distillation_ppo_loss,
+        config=actor_config,
+        distillation_config=distillation_config,
+    )
+else:
+    self.loss_fn = partial(ppo_loss, config=actor_config)
+```
+
+对应 [`engine_workers.py` L544–590](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine_workers.py#L544-L590)。所以 OPD 不是另起一个 actor trainer；它复用 PPO actor engine，只替换最终 loss 函数并增加 teacher 字段。
+
+## 一条 trajectory 怎样进入 TransferQueue
+
+### 1. 按样本 fan-out
+
+`AgentLoopWorkerTQ.generate_sequences()` 为 batch 中每个样本创建 asyncio task，再按 `rollout.n` fan-out 多条 trajectory：[`agent_loop_tq.py` L54–125](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/agent_loop_tq.py#L54-L125)。
+
+### 2. rollout 完成后立刻查 teacher
+
+在 `_agent_loop_postprocess()` 中：
+
+```text
+student rollout 完成
+  ↓
+计算 reward score
+  ↓
+对最终 output 查询 teacher logprobs
+  ↓
+整理 input_ids / masks / position_ids
+  ↓
+写入 TransferQueue
+```
+
+源码：[`agent_loop_tq.py` L130–207](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/agent_loop_tq.py#L130-L207)。
+
+这是 **per-sample overlap**：先完成的样本不用等慢样本，就可以占用 teacher replica；其他 rollout 仍可同时继续。它不等于旧 recipe 里的 batch ZMQ teacher service。
+
+### 3. teacher 不重新写答案
+
+通用 `AgentLoopWorker._compute_teacher_logprobs()` 把：
+
+```python
+sequence_ids = prompt_ids + response_ids
+```
+
+送给 teacher，并附带多模态数据与业务路由 key；见 [`agent_loop.py` L1000–1023](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/agent_loop/agent_loop.py#L1000-L1023)。
+
+teacher 请求使用 `max_tokens=1`，监督来自输入 prefix 的 `prompt_logprobs`；见 [`teacher_manager.py` L30–43](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_manager.py#L30-L43)。也就是说，teacher 在学生实际走过的每个状态上回答“下一 token 分布是什么”，而不是生成另一条 teacher trajectory。
+
+<Callout type="info" title="Validation 是例外">
+  <code>_compute_teacher_logprobs()</code> 只在 <code>distillation_enabled and not validate</code> 时执行。默认 validation 看 task reward/accuracy，不计算 teacher KL。不要在验证日志里寻找 OPD loss。
+</Callout>
+
+## 数据协议：每个字段是什么时候来的
+
+TransferQueue 中的数据是变长 jagged tensor。一个训练样本的主要字段如下：
+
+| 字段 | 生产者 | 语义 | 形状 |
+|---|---|---|---|
+| `prompts` | agent loop | 未 padding 的 prompt ids | `[B, Pᵢ]` jagged |
+| `responses` | student rollout | student 生成的 response ids | `[B, Rᵢ]` jagged |
+| `input_ids` | agent postprocess | `prompt + response` | `[B, Pᵢ+Rᵢ]` jagged |
+| `response_mask` | agent loop | 1=student token；0=tool/pad | `[B, Rᵢ]` jagged |
+| `loss_mask` | agent postprocess | 当前直接等于 `response_mask` | `[B, Rᵢ]` jagged |
+| `teacher_logprobs` | teacher server | sampled-token 或 teacher top-k logprob | `[B, Pᵢ+Rᵢ, 1/K]` jagged |
+| `teacher_ids` | teacher server | 与 teacher logprob 对应的 vocab ids | `[B, Pᵢ+Rᵢ, 1/K]` jagged |
+| `old_log_probs` | actor infer | actor update 前的 response action logprob | `[B, Rᵢ]` jagged |
+| `advantages` | controller | task reward 路径的 advantage | `[B, Rᵢ]` jagged |
+| `rollout_is_weights` | rollout correction，可选 | 异步/off-policy 修正权重 | `[B, Rᵢ]` jagged |
+
+`AgentLoopOutput.as_dict()` 会把 `teacher_ids/logprobs` 从 `extra_fields` 提升为正式 tensor 字段：[`agent_loop.py` L116–147](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/agent_loop/agent_loop.py#L116-L147)。对 3D jagged teacher tensor 的 chunk/index 回归测试见 [`test_protocol_v2_on_cpu.py` L888–920](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/tests/test_protocol_v2_on_cpu.py#L888-L920)。
+
+### 为什么既有 rollout logprob 又有 old logprob
+
+rollout engine 可以返回生成时的 `rollout_log_probs`，但 actor update 默认还会用训练 engine 重算 `old_log_probs`。这样 PPO mini-epochs 有一个稳定的 proximal anchor，也能测 rollout engine 与 train engine 的 logprob 差异。
+
+V1 的 `_compute_old_log_prob()` 在 [`trainer_base.py` L1222–1281](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_base.py#L1222-L1281)。只有 rollout-correction bypass mode 才直接令 `old_log_probs = rollout_log_probs`。
+
+## Controller 的一次同步 step
+
+`PPOTrainer.step()` 是最值得先背下来的总顺序：
+
+```text
+1  _add_batch_to_generate()
+2  replay_buffer.sample(train_batch_size)
+3  optional colocated reward
+4  balance/upsample batch for DP
+5  _compute_old_log_prob()
+6  optional _compute_ref_log_prob()
+7  optional _compute_values()
+8  _compute_advantage()
+9  optional _update_critic()
+10 _update_actor()  ← OPD loss 在这里反传
+```
+
+逐行证据：[`trainer_base.py` L406–458](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_base.py#L406-L458)。
+
+<Callout type="warn" title="Pure OPD 仍会经过 PPO plumbing">
+  即使 <code>distillation.distillation_loss.use_task_rewards=false</code>，当前 controller 仍计算 reward、old logprob 和 advantage；最终 loss 也先调用普通 <code>ppo_loss</code>，再把 policy term 置零。它们是当前实现的数据依赖与开销，不代表 pure OPD 的数学目标需要 GRPO reward。
+</Callout>
+
+## Teacher 服务怎样扩展到多个模型
+
+### 每个 teacher 自己管理 replicas
+
+`MultiTeacherModelManager` 先按每个 teacher 的总 world size 切分 `teacher_pool`，再为每个 teacher 创建 `TeacherModelManager`；见 [`teacher_model.py` L154–203](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_model.py#L154-L203)。
+
+单 replica 所占 GPU 为：
+
+$$
+W_{\mathrm{replica}} = \mathrm{TP}\times\mathrm{DP}\times\mathrm{PP}.
+$$
+
+每个 teacher 的总占用为 `num_replicas × W_replica`。总和必须精确等于 teacher pool，否则配置实例化阶段就报错。
+
+### 每个 teacher 有独立 load balancer
+
+`GlobalRequestLoadBalancer` 优先维持 sticky mapping；新请求在 in-flight 最少的 server 中选择。客户端通过 Ray RPC acquire、调用 server、finally release；见：
+
+- [`llm_server.py` L65–118](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/rollout/llm_server.py#L65-L118)
+- [`llm_server.py` L165–249](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/rollout/llm_server.py#L165-L249)
+
+### 多教师按业务字段路由
+
+默认 `teacher_key=data_source`。单 teacher 忽略 route；多 teacher 要求样本值完全匹配某个 teacher `key`，否则报错。实现见 [`teacher_manager.py` L73–100](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_manager.py#L73-L100)。
+
+## Actor 与 rollout 的权重一致性
+
+默认 sync trainer 在：
+
+- 初始化 checkpoint 后先同步一次 actor→rollout；
+- 每个训练 step 结束再同步新 actor 权重；
+- rollout 完成后让 replicas sleep，释放权重/KV cache。
+
+源码只有十几行，建议直接读 [`trainer_sync.py` L24–42](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_sync.py#L24-L42)。teacher 是冻结服务，不参加这条权重同步。
+
+## Legacy、V1 async 与 fully async 的边界
+
+<Tabs items={['默认 V1 sync', 'Legacy V0', 'V1 async', 'Fully async', '旧 recipe/gkd']}>
+  <Tab value="默认 V1 sync">
+
+**状态来源：** 每步同步新权重后生成下一批，最接近严格 on-policy。
+
+**数据协议：** `KVBatchMeta + TransferQueue`。
+
+**适合：** 第一次读源码、验证算法正确性、建立稳定 baseline。
+
+  </Tab>
+  <Tab value="Legacy V0">
+
+**入口：** `trainer.use_v1=false`。
+
+**数据协议：** 主要使用 `DataProto`，trainer 是 `RayPPOTrainer`。
+
+**状态：** 本快照已经打印 deprecated warning，但 OPD manager/loss 接线仍保留。旧文档和一些 recipe 仍以它为叙述主体。
+
+  </Tab>
+  <Tab value="V1 async">
+
+**模式：** `colocate_async` 或 `separate_async`。
+
+**变化：** rollout、训练和参数同步重叠；replay buffer 允许有限 model-version staleness。配置入口见 [`ppo_trainer.yaml` L203–236](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/config/ppo_trainer.yaml#L203-L236)。
+
+**措辞：** 更准确地称为 bounded-staleness OPD，而不是严格 on-policy。
+
+  </Tab>
+  <Tab value="Fully async">
+
+独立入口 `verl.experimental.fully_async_policy.fully_async_main` 将 rollout、training、teacher 拆到不同 GPU 池，支持 partial rollout、staleness threshold 与低频参数同步。teacher clients 的接线见 [`fully_async_rollouter.py` L623–713](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/fully_async_policy/fully_async_rollouter.py#L623-L713)。
+
+仓库的 8-GPU MOPD E2E 脚本见 [`run_fully_async_policy_opd.sh`](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/tests/special_e2e/run_fully_async_policy_opd.sh)。
+
+  </Tab>
+  <Tab value="旧 recipe/gkd">
+
+`docs/advance/async-on-policy-distill.md` 描述的是外部 `verl-recipe` submodule 中的 ZMQ teacher service、one-step-off/two-step-off scheduler 与 Megatron recipe。
+
+本地快照的 `recipe` submodule 没有 checkout，不能用它证明当前原生 `distillation.*` 的运行细节。不要把“ZMQ micro-batching teacher”写成 V1 原生架构。
+
+  </Tab>
+</Tabs>
+
+## 三条不要混淆的并行线
+
+```text
+Ray / resource-pool 并行：把不同角色放到不同进程和 GPU bundle
+模型并行：teacher replica 内的 TP × DP × PP
+训练并行：student actor 的 DP / FSDP-SP / Megatron-TP-CP-PP
+```
+
+teacher logprob 通过 Ray server RPC 回到 trajectory；进入 actor 后，top-k tensor 才按 student 的 SP/CP/TP 规则切分。架构层先记住这条边界，下一章再逐行看通信。
+
+## 读完后的自检
+
+<details>
+<summary>为什么 teacher 是独立 inference replica，而不是 Actor worker 的一个 forward mode？</summary>
+
+teacher checkpoint 固定、通常更大，并且希望与 student rollout/actor update 并发。独立 pool 可以单独配置 TP/DP/PP、replica 数与 load balancing，也不会参与 actor optimizer 和 actor→rollout 权重同步。
+
+</details>
+
+<details>
+<summary>为什么默认 sync 里仍然出现 replay buffer？</summary>
+
+V1 用统一的 TransferQueue/replay-buffer 协议接收 agent-loop 结果；sync 模式会等待当前要训练的 batch，async 模式则允许从有版本约束的积压 trajectory 中采样。存在 replay buffer 不自动意味着默认就是长时间 off-policy。
+
+</details>
+
+<details>
+<summary>teacher query 与 actor update 哪个先发生？</summary>
+
+每条 trajectory 的 teacher query 在 rollout postprocess 阶段就发生，并把结果写进队列；controller 收到完整训练 batch、补齐 old logprob/advantage 后，才调用 actor update。
+
+</details>
+
+## 下一步
+
+<Cards>
+  <Card title="逐函数走完一次 step" href="/docs/engineering/verl-codewalk">
+    从 teacher dummy row、causal shift 到 GKD/PG loss 的每个 tensor。
+  </Card>
+  <Card title="配置与启动手册" href="/docs/engineering/config-runbook">
+    选择 FSDP、Megatron、VeOmni、MOPD 并算清 GPU。
+  </Card>
+  <Card title="第一次最小实验" href="/docs/practice/first-run">
+    用同模型 plumbing baseline 与小规模真实蒸馏建立可复现实验记录。
+  </Card>
+</Cards>

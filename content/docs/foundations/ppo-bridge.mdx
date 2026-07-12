@@ -1,0 +1,359 @@
+---
+title: 从 PPO 走到 OPD
+description: 对齐 policy ratio、advantage、critic、clip 与 KL 对象，理解 OPD 借用了 RL 训练骨架但不等于 PPO。
+---
+
+<Callout type="warn" title="先说结论">
+  Tinker OPD 借用了 on-policy RL 的 rollout、advantage 和 importance-ratio 更新骨架，但默认并没有使用 PPO clipped objective，也没有 critic。它的监督来自固定教师的逐 token log-prob，而不是环境结果奖励。
+</Callout>
+
+如果你学过 PPO，会发现 Tinker OPD 的代码非常眼熟：先采样、存旧 log-prob、计算 advantage，再做一次带 probability ratio 的更新。
+
+“眼熟”不等于“相同”。本章把相似与不同都精确落到公式中。
+
+## 共同语言：prefix 是 state，token 是 action
+
+在 LLM 中，可以把：
+
+| RL 概念 | LLM 对应物 |
+|---|---|
+| state $s_t$ | prompt 与生成前缀 $(x,y_{<t})$ |
+| action $a_t$ | 下一个 token $y_t$ |
+| policy $\pi_\theta$ | 语言模型 next-token 分布 |
+| rollout | completion |
+| reward | 正确性、偏好分数，或教师给出的 dense 信号 |
+
+因此，PPO 和 OPD 都可以使用同一套“采样策略 → 轨迹 → advantage → policy update”基础设施。
+
+## PPO 原论文的核心
+
+PPO 每轮用旧策略 $\pi_{\theta_{\mathrm{old}}}$ 与环境交互，得到状态、动作和 advantage 估计，再优化新策略。定义 probability ratio：
+
+$$
+r_t(\theta)
+=\frac{\pi_\theta(a_t\mid s_t)}
+{\pi_{\theta_{\mathrm{old}}}(a_t\mid s_t)}.
+$$
+
+最朴素的 policy-gradient surrogate 是：
+
+$$
+L^{\mathrm{CPI}}(\theta)
+=\mathbb E_t\left[r_t(\theta)\hat A_t\right].
+$$
+
+如果反复使用同一批 rollout，$\pi_\theta$ 可能离 $\pi_{\mathrm{old}}$ 太远。PPO-Clip 使用：
+
+$$
+L^{\mathrm{CLIP}}(\theta)
+=\mathbb E_t\left[
+\min\left(
+r_t(\theta)\hat A_t,\,
+\operatorname{clip}(r_t(\theta),1-\epsilon,1+\epsilon)\hat A_t
+\right)
+\right].
+$$
+
+原论文给出 $\epsilon=0.2$ 作为示例。clip 去掉了“继续把 ratio 推出安全区仍能改善 surrogate”的激励，但当更新让目标变差时不会替你截掉损失。[PPO §3](https://arxiv.org/pdf/1707.06347)
+
+### PPO 的完整 actor–critic 版本
+
+原论文还给出组合目标：
+
+$$
+L^{\mathrm{CLIP+VF+S}}
+=\mathbb E_t\left[
+L_t^{\mathrm{CLIP}}
+-c_1L_t^{\mathrm{VF}}
++c_2S[\pi_\theta](s_t)
+\right],
+$$
+
+其中：
+
+- $L^{\mathrm{VF}}$ 是 value-function error；
+- $S$ 是 entropy bonus；
+- advantage 可用 value function 和 GAE 估计；
+- 同一批 $NT$ timesteps 通常以 minibatch 做 $K$ 个 epochs。
+
+来源：[PPO §5 与 Algorithm 1](https://arxiv.org/pdf/1707.06347)。
+
+## Tinker OPD 的核心
+
+Tinker 基础 OPD 从当前学生 sampler 生成 action，记录：
+
+- $\log p_{\mathrm{sample}}(a_t\mid s_t)$；
+- 教师在同一 token 上的 $\log q_{\mathrm{teacher}}(a_t\mid s_t)$。
+
+它构造：
+
+$$
+A_t^{\mathrm{OPD}}
+=-\beta\left(
+\log p_{\mathrm{sample}}(a_t\mid s_t)
+-\log q_{\mathrm{teacher}}(a_t\mid s_t)
+\right),
+$$
+
+其中 $\beta$ 对应 <code>kl_penalty_coef</code>。然后用 learner/sampler ratio：
+
+$$
+\rho_t(\theta)
+=\frac{p_\theta(a_t\mid s_t)}
+{p_{\mathrm{sample}}(a_t\mid s_t)}
+$$
+
+优化 importance-sampling loss：
+
+$$
+\mathcal L_{\mathrm{IS}}
+=-\mathbb E_t\left[\rho_t(\theta)A_t^{\mathrm{OPD}}\right].
+$$
+
+Tinker 官方文档给出的实现正是：
+
+~~~python
+prob_ratio = torch.exp(target_logprobs - sampling_logprobs)
+loss = -(prob_ratio * advantages).sum()
+~~~
+
+来源：[Tinker Importance Sampling](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/)。
+
+## 两条训练循环并排看
+
+### PPO
+
+~~~text
+1. 用旧策略与环境交互
+2. 获得 reward / return
+3. 用 value function 或 baseline 估计 advantage
+4. 计算新旧策略 ratio
+5. 用 clipped surrogate 做 K epochs 更新
+6. 令旧策略追上新策略，进入下一轮
+~~~
+
+### Tinker OPD
+
+~~~text
+1. 从当前学生保存 sampler
+2. 学生生成 rollouts
+3. 固定教师给学生采到的每个 token 算 log-prob
+4. 用 log q_teacher - log p_sample 构造 dense advantage
+5. 用未裁剪 importance-sampling loss 更新
+6. 保存最新权重，下一轮使用新 sampler
+~~~
+
+两者共享“旧/采样策略收集数据，新/学习策略做更新”的形状，但 reward source、advantage estimator 和稳定化机制不同。
+
+## 逐项对照
+
+| 维度 | Tinker 基础 OPD | PPO 原论文 |
+|---|---|---|
+| rollout | 当前学生 sampler | 旧策略 $\pi_{\mathrm{old}}$ |
+| 监督来源 | 固定教师 log-prob | 环境 reward |
+| advantage | 逐 token $\log q-\log p$ | return 减 baseline，常用 value/GAE |
+| 信号密度 | 每个生成 token | 由 reward 结构决定，常为序列级 |
+| probability ratio | learner / sampler | new / old |
+| 默认 loss | 未裁剪 importance sampling | clipped surrogate |
+| critic | 没有 | actor–critic 版本有 |
+| value loss | 没有 | 有 |
+| entropy bonus | 没有显式项 | 可加入 |
+| KL 对象 | 学生到固定教师 | 新策略到旧策略的 trust region/penalty |
+| 数据重用 | 默认每条 datum 一次 | 常对同一批数据做 $K$ epochs |
+| credit assignment | 默认立即 token KL；可累计未来 KL | return / GAE |
+
+## 相似点 1：都需要旧 log-prob
+
+rollout 是由采样策略产生的，但 forward/backward 时 learner 可能已经有细微变化，或者采样服务存在数值偏差。两者都保存采样时的 log-prob，用 ratio 修正更新。
+
+PPO：
+
+$$
+r_t=\exp\left(
+\log\pi_\theta(a_t\mid s_t)
+-\log\pi_{\mathrm{old}}(a_t\mid s_t)
+\right).
+$$
+
+Tinker：
+
+$$
+\rho_t=\exp\left(
+\log p_{\mathrm{learner}}(a_t\mid s_t)
+-\log p_{\mathrm{sample}}(a_t\mid s_t)
+\right).
+$$
+
+数学形状相同，但 Tinker 默认不 clip 这个 ratio。
+
+<Callout type="info" title="还有另一个 log-ratio">
+  OPD 的教师监督本身还包含 $\log p_{\mathrm{sample}}-\log q_{\mathrm{teacher}}$。它决定 advantage；learner/sampler ratio 决定如何用这条已采数据更新当前 learner。这两个 ratio 不能互换。
+</Callout>
+
+## 不同点 1：advantage 从哪里来
+
+### PPO advantage
+
+PPO 的 $\hat A_t$ 估计 action 相对当前 baseline 带来了多少额外 return。它通常依赖：
+
+- 环境 reward；
+- bootstrapped value；
+- 折扣因子 $\gamma$；
+- GAE 参数 $\lambda$。
+
+这是典型的跨时间 credit assignment。
+
+### Tinker OPD advantage
+
+Tinker 的基础环境 reward 始终为 0。源码先做 group reward centering，得到的环境 advantage 也为 0；随后才把教师 reverse-KL 信号逐 token 加进去：
+
+- zero-reward environment：[datasets.py L85–121](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/datasets.py#L85-L121)；
+- group-centered reward advantage：[data_processing.py L23–42](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/data_processing.py#L23-L42)；
+- 加入 KL advantage：[train_on_policy.py L101–108](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L101-L108)。
+
+因此 <code>group_size=4</code> 在这份 recipe 中主要是同一 prompt 多采几条轨迹，并不是依靠组内正确/错误 reward 排序。
+
+## 不同点 2：有没有 critic
+
+基础 Tinker OPD 没有 value model，也不拟合 return。原因很直接：教师已经在每个 token 上给出 dense log-ratio，默认不需要用 critic 把一个稀疏终局奖励分摊到所有动作。
+
+这不意味着“OPD 永远不能有 critic”。GKD 论文允许把 on-policy distillation 与外部 RL reward 组合；一旦同时优化序列奖励，就可能重新需要 value/GAE 或其他 advantage estimator。[GKD §3.2](https://arxiv.org/pdf/2306.13649)
+
+## 不同点 3：clip 在哪里
+
+Tinker 的 OPD config 默认：
+
+~~~python
+loss_fn = "importance_sampling"
+loss_fn_config = None
+~~~
+
+源码：[train_on_policy.py L149–156](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L149-L156)。
+
+Tinker 也支持把 <code>loss_fn</code> 换成 <code>ppo</code>；官方 loss 文档说明 PPO 默认裁剪 learner/sampler ratio，而 importance sampling 不裁剪。[Tinker Loss Functions](https://tinker-docs.thinkingmachines.ai/tinker/losses/)
+
+但 cookbook 当前报告的 OPD 结果使用默认 importance sampling。不能把“PPO clip 的稳定性收益”写成该 recipe 已经验证的结论。
+
+## 不同点 4：KL 到底比较谁
+
+这是最容易造成概念事故的一项。
+
+### OPD 的 teacher KL
+
+$$
+D_{\mathrm{KL}}\left(
+p_{\mathrm{student}}
+\middle\|
+q_{\mathrm{teacher}}
+\right).
+$$
+
+它定义了“学生应该靠近谁”。教师固定，是训练目标。
+
+### PPO / TRPO 的 trust-region KL
+
+$$
+D_{\mathrm{KL}}\left(
+\pi_{\mathrm{old}}
+\middle\|
+\pi_\theta
+\right)
+$$
+
+或相近方向的策略距离。它定义了“一次更新不要走多远”。旧策略每轮刷新，是稳定化约束。PPO 论文 §2–4 讨论的 KL constraint/penalty 对象是新旧策略，而不是蒸馏教师。[PPO PDF](https://arxiv.org/pdf/1707.06347)
+
+| KL | 参照分布是否固定 | 回答的问题 |
+|---|---:|---|
+| student ↔ teacher | 是 | 最终要学成什么行为？ |
+| new policy ↔ old policy | 否，每轮刷新 | 这一步更新是否太大？ |
+
+<Callout type="warn" title="kl_penalty_coef 不是 PPO trust-region 系数">
+  Tinker OPD 的 <code>kl_penalty_coef</code> 缩放教师监督。它并不约束“新学生不要离旧学生太远”。把它调小会减弱教师信号，而不是自动获得 PPO 的 proximal guarantee。
+</Callout>
+
+## 为什么博文会说 RL 也像 Reverse KL？
+
+Thinking Machines 的原话带有限定：RL “generally optimizes a form of sequence-level reverse KL induced by the reward model”。在带 entropy/KL regularization 的最大熵 RL 中，可以定义 reward-tilted target：
+
+$$
+q_R(y\mid x)\propto
+\pi_{\mathrm{ref}}(y\mid x)\exp\left(\frac{R(y)}{\beta}\right),
+$$
+
+然后把优化写成逼近 $q_R$ 的 reverse-KL 形式。这个视角很有用，但要保留三个限定：
+
+1. 是 reward 诱导出的 target distribution；
+2. 通常依赖 entropy 或 reference-policy KL regularization；
+3. 裸的 PPO clipped surrogate 本身不是“对教师做 reverse KL”。
+
+因此，“RL 与 OPD 都可从 reverse-KL 视角理解”不等于“OPD 就是 PPO”。来源：[Thinking Machines 博文 Loss function](https://thinkingmachines.ai/blog/on-policy-distillation/)。
+
+## num_substeps 也不是 PPO 的 K epochs
+
+Tinker <code>train_step()</code> 把大 batch 分成 <code>num_substeps</code> 个不重叠子批，每个子批执行一次 forward/backward 与 optimizer step。[rl/train.py L278–362](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/train.py#L278-L362)
+
+PPO 的 $K$ epochs 则是对**同一批 rollout 数据重复训练多轮**。两者都可能产生 learner/sampler 偏移，但数据使用方式不同。
+
+## 如果把 Tinker loss_fn 改成 ppo
+
+会改变的：
+
+- learner/sampler ratio 被 clipped；
+- 当同一 sampler 数据被较强更新时，surrogate 更保守；
+- 可通过 <code>loss_fn_config</code> 设置 clip 阈值。
+
+不会改变的：
+
+- rollout 仍来自学生；
+- 教师仍必须为学生 token 算 log-prob；
+- advantage 仍是教师 reverse-KL 信号；
+- teacher KL 仍是目标，PPO clip 只是优化稳定化手段；
+- 基础环境 reward 仍为 0，除非你另行加入。
+
+最准确的名字是：**PPO-style clipped optimizer for OPD**，而不是“把 OPD 变成 PPO”。
+
+## 什么时候考虑 clip？
+
+这不是当前 cookbook 已证明的结论，但从机制上可以提出可检验假设：
+
+- 一个 rollout batch 做多次更新；
+- <code>num_substeps</code> 较多，后续子批面对已变化的 learner；
+- learner/sampler KL 或 importance ratio 出现长尾；
+- 学习率较高，更新不稳定。
+
+正确做法是做消融：同一数据、同一 teacher advantage，对比 importance sampling 与 PPO clip，并同时记录 task metric、teacher KL、learner/sampler KL、clip fraction 和输出长度。
+
+<Cards>
+  <Card title="回看 KL 的两个 ratio" href="/docs/foundations/kl-divergence">
+    重新区分教师监督 log-ratio 与 learner/sampler importance ratio。
+  </Card>
+  <Card title="进入 Tinker 源码" href="/docs/engineering/tinker-cookbook">
+    看 loss_fn 如何从 CLI 穿过 Config，最终进入 forward_backward。
+  </Card>
+</Cards>
+
+## 自测
+
+1. Tinker OPD 默认使用 PPO-Clip 吗？
+2. teacher KL 和 PPO trust-region KL 分别比较哪些模型？
+3. 把 <code>loss_fn</code> 改成 <code>ppo</code> 后，还需要教师吗？
+4. 为什么基础 OPD 不需要 critic？
+
+<details>
+<summary>查看答案</summary>
+
+1. 不使用；默认是未裁剪 importance sampling。
+2. 前者比较学生与固定教师；后者比较当前新策略与本轮旧策略。
+3. 需要。clip 只改变 learner/sampler 更新方式，advantage 仍来自教师。
+4. 因为教师已经提供逐 token dense signal，不需要用 value model 从稀疏结果奖励估计每个 token 的 credit。若再加入外部 RL reward，则可能重新需要 critic。
+
+</details>
+
+## 一手资料
+
+- [Schulman et al. — Proximal Policy Optimization Algorithms](https://arxiv.org/abs/1707.06347)
+- [PPO 原论文 PDF](https://arxiv.org/pdf/1707.06347)
+- [Tinker — Importance Sampling](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/)
+- [Tinker — Loss Functions](https://tinker-docs.thinkingmachines.ai/tinker/losses/)
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [GKD §3.2：RL + On-policy GKD](https://arxiv.org/pdf/2306.13649)

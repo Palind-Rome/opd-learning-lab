@@ -1,0 +1,595 @@
+---
+title: 一次 verl OPD step 的逐行源码走读
+description: 从 Hydra 配置、student rollout、teacher prompt-logprobs、causal shift 与 response mask，一直跟到 GKD/PG-OPD loss、反向传播和并行通信。
+---
+
+<Callout type="info" title="本章的阅读约定">
+  源码版本固定为 <code>1ff76cc625e9820d2434dad1b6d9b8e5dd26a359</code>。记 student 分布为 <code>q</code> 或 $\pi_\theta$，teacher 分布为 <code>p</code> 或 $\nu$；所有状态 $s_t=(x,y_{\lt t})$ 都来自 student rollout。
+</Callout>
+
+这是一条“跟着一个 batch 走”的路线。建议先打开两个窗口：左边看本章，右边从 [`verl/trainer/main_ppo.py`](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/main_ppo.py) 开始跳转源码。
+
+## 调用链总览
+
+```text
+main_ppo.main
+  → TaskRunnerV1.run
+  → PPOTrainerSync.fit
+  → PPOTrainer.step
+      → _add_batch_to_generate
+          → AgentLoopWorkerTQ.generate_sequences
+          → _run_agent_loop
+          → _agent_loop_postprocess
+              → _compute_score
+              → _compute_teacher_logprobs
+                  → AsyncTeacherLLMServerManager.compute_teacher_logprobs_single
+      → replay_buffer.sample
+      → _compute_old_log_prob
+      → _compute_advantage
+      → _update_actor
+          → ActorRolloutRefWorker.update_actor
+          → TrainingWorker.train_mini_batch
+          → engine.train_batch
+          → distillation_ppo_loss
+```
+
+<Cards>
+  <Card title="先补宏观架构" href="/docs/engineering/verl-architecture">
+    不清楚 Ray 角色、teacher_pool 与 TransferQueue 时先读这里。
+  </Card>
+  <Card title="公式基础" href="/docs/foundations/kl-divergence">
+    不清楚 forward/reverse KL 与 k1/k3 时先读推导。
+  </Card>
+</Cards>
+
+## Step 0：Hydra 把 OPD 接进 PPO 配置树
+
+`ppo_trainer.yaml` 用：
+
+```yaml
+defaults:
+  - distillation@distillation: distillation
+```
+
+把 [`config/distillation/distillation.yaml`](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/config/distillation/distillation.yaml) 挂在顶层 `distillation.*`。接线见 [`ppo_trainer.yaml` L7–47](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/config/ppo_trainer.yaml#L7-L47)。
+
+随后 `_target_` 把 YAML 转成三个 dataclass：
+
+- `DistillationConfig`
+- `DistillationTeacherModelConfig`
+- `DistillationLossConfig`
+
+定义在 [`workers/config/distillation.py` L31–320](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L31-L320)。
+
+初始化阶段就会完成：
+
+1. loss name 查 registry；
+2. 判定需要 sampled-token 还是 top-k teacher signal；
+3. 校验 `k1 + direct` 等非法组合；
+4. 解析单/多 teacher；
+5. 重写 teacher context 长度；
+6. 校验 teacher GPU 总数。
+
+<Callout type="warn" title="YAML 默认与 dataclass 默认不完全相同">
+  <code>main_ppo</code> 的用户可见默认应以 YAML 为准：<code>topk=32</code>、<code>use_policy_gradient=false</code>、两个 clamp 都为 <code>null</code>。直接在 Python 中写 <code>DistillationLossConfig()</code> 才会得到 dataclass 的 <code>topk=128</code>、<code>use_policy_gradient=true</code>、clamp 10/-10。不要只看类定义就断言 CLI 默认。
+</Callout>
+
+## Step 1：student 在自己的 policy 上生成
+
+`AgentLoopWorkerTQ.generate_sequences()` 从 student rollout config 读：
+
+```python
+sampling_params = {
+    "temperature": config.temperature,
+    "top_p": config.top_p,
+    "top_k": config.top_k,
+    "repetition_penalty": 1.0,
+    "logprobs": config.calculate_log_probs,
+}
+```
+
+源码：[`agent_loop_tq.py` L54–72](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/agent_loop_tq.py#L54-L72)。随后每个输入样本成为独立 asyncio task，`rollout.n` 决定每个 prompt 采几条 trajectory：[`agent_loop_tq.py` L80–125](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/agent_loop_tq.py#L80-L125)。
+
+这里得到的是：
+
+$$
+y\sim q_{\theta_{\text{rollout}}}(\cdot\mid x).
+$$
+
+默认 sync 下，`θ_rollout` 是上一个 step 结束后同步的最新 actor 权重；异步模式下它可能是受 staleness 阈值约束的旧版本。
+
+## Step 2：rollout 完成后，teacher 对相同序列打分
+
+`_agent_loop_postprocess()` 先算 reward，再调用 teacher：[`agent_loop_tq.py` L130–150](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/agent_loop_tq.py#L130-L150)。通用实现把 student 序列拼成：
+
+```python
+sequence_ids = prompt_ids + response_ids
+```
+
+并交给 `compute_teacher_logprobs_single()`：[`agent_loop.py` L1000–1023](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/agent_loop/agent_loop.py#L1000-L1023)。
+
+teacher 选择规则：
+
+- 单 teacher：忽略样本 route；
+- 多 teacher：读取 `sample[distillation.teacher_key]`，默认是 `data_source`；
+- route 缺失或不匹配直接报错。
+
+见 [`teacher_manager.py` L73–100](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_manager.py#L73-L100)。
+
+### Teacher sampling params
+
+```python
+num_logprobs = topk if loss_settings.use_topk else 0
+sampling_params = {
+    "max_tokens": 1,
+    "temperature": 1.0,
+    "prompt_logprobs": num_logprobs,
+}
+```
+
+源码：[`teacher_manager.py` L30–43](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_manager.py#L30-L43)。
+
+因此两种 signal 是：
+
+| loss 家族 | teacher 返回 | 每个状态的最后一维 |
+|---|---|---:|
+| sampled estimator：`k1/k3/...` | student 已选 token 在 teacher 下的 logprob | 1 |
+| `forward_kl_topk` | teacher top-k token ids 与 logprobs | K |
+
+`compute_teacher_logprobs_single()` 最终构造 `[S,1/K]` 的 `teacher_ids` 与 `teacher_logprobs`，并断言 `S == len(sequence_ids)`；见 [`teacher_manager.py` L102–128](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_manager.py#L102-L128)。
+
+## Step 3：解开最关键的 off-by-one
+
+假设：
+
+```text
+prompt   = [x0, x1]           P = 2
+response = [y0, y1, y2]       R = 3
+sequence = [x0, x1, y0, y1, y2], S = 5
+```
+
+### Backend 原始 prompt logprobs
+
+```text
+位置 0: None
+位置 1: p(x1 | x0)
+位置 2: p(y0 | x0,x1)
+位置 3: p(y1 | x0,x1,y0)
+位置 4: p(y2 | x0,x1,y0,y1)
+```
+
+第一个 token 没有左上下文，所以 logprob 为 `None`。
+
+### verl 的 teacher rows
+
+vLLM extractor 跳过第 0 项，再在末尾补 dummy：
+
+```text
+row 0: p(x1 | x0)
+row 1: p(y0 | x0,x1)
+row 2: p(y1 | ...)
+row 3: p(y2 | ...)
+row 4: dummy
+```
+
+源码：[`vllm_rollout/utils.py` L447–480](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/rollout/vllm_rollout/utils.py#L447-L480)。SGLang 明确复制同一 contract：[`async_sglang_server.py` L62–109](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/rollout/sglang_rollout/async_sglang_server.py#L62-L109)。
+
+### Student logits rows
+
+causal LM 的 logits row `i` 也预测 token `i+1`：
+
+```text
+row 0 → x1
+row 1 → y0
+row 2 → y1
+row 3 → y2
+row 4 → sequence 之后的 token
+```
+
+最终 `no_padding_2_padding()` 对每条序列取：
+
+```python
+values[seq_offset - response_len - 1 : seq_offset - 1]
+```
+
+本例就是 rows `[1:4]`，恰好预测 `y0,y1,y2`。实现见 [`padding.py` L99–143](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/utils/padding.py#L99-L143)。
+
+| 被排除的行 | 为什么不进 loss |
+|---|---|
+| teacher 的 prompt 部分 | response slice 从 `P-1` 开始 |
+| teacher 的 trailing dummy | slice 在 `S-1` 结束，不含末尾 |
+| student 每条序列最后 logits row | 同样被 `S-1` 截掉，避免跨样本 `torch.roll` 污染 |
+| tool/pad token | 留在上下文，但 `response_mask=0` |
+
+<Callout type="info" title="为什么 flatten 后的 torch.roll 没有串样本">
+  FSDP no-padding 路径把所有序列 flatten 后整体 <code>torch.roll(..., -1)</code>。每条序列最后一行确实会指向下一条序列开头，但 response slice 永远排除每条序列最后 logits row，所以错误 label 不参与任何 response loss。
+</Callout>
+
+## Step 4：mask 保留状态，但只训练 student token
+
+Agent loop 的三种 mask 不要混淆：
+
+| mask | 1 的含义 | 用途 |
+|---|---|---|
+| prompt attention mask | 非 padding prompt token | 模型注意力 |
+| response attention mask | 非 padding response token | 模型注意力 |
+| response mask | student 生成、允许训练的 token | PPO/OPD loss |
+
+多轮工具调用中，tool response token 必须留在 `input_ids`，因为它们决定后续 student state；但其 `response_mask=0`，不让 student 模仿工具输出。源码注释与构造见 [`agent_loop.py` L727–774](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/agent_loop/agent_loop.py#L727-L774)。
+
+`AgentLoopWorkerTQ` 当前直接设置：
+
+```python
+field["loss_mask"] = field["response_mask"]
+```
+
+见 [`agent_loop_tq.py` L173–183](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/agent_loop_tq.py#L173-L183)。
+
+## Step 5：actor 重算 old logprob
+
+controller 从队列取出 batch 后，先按 DP 工作量重排，再调用 `_compute_old_log_prob()`：
+
+1. 令 actor forward `compute_loss=False`；
+2. 计算 full-sequence logprob 与 entropy；
+3. 用 response causal slice 取 action logprob；
+4. 写回队列为 `old_log_probs`。
+
+源码：[`trainer_base.py` L1196–1281](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_base.py#L1196-L1281)。
+
+为什么不总用 rollout engine 返回的 logprob？train/rollout engine、dtype、kernel 可能存在差异；重算得到 actor update 的稳定 anchor。若显式启用 rollout-correction bypass mode，才直接令 `old_log_probs = rollout_log_probs`。
+
+## Step 6：即使 pure OPD，也先构造 task advantage
+
+`_compute_advantage()` 会：
+
+- 把 reward score 变成 `token_level_scores`；
+- 可选加 reference KL penalty；
+- 可选计算 rollout correction；
+- 按 PPO/GRPO 等 estimator 构造 `advantages/returns`；
+- 把结果写回 TransferQueue。
+
+见 [`trainer_base.py` L1331–1390](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_base.py#L1331-L1390)。
+
+这一步会发生，即使稍后 `use_task_rewards=false`。当前架构复用 PPO plumbing；不要把 task advantage 与 teacher distillation advantage 混成一个量。
+
+## Step 7：actor update 加入 OPD 元数据
+
+`_update_actor()` 读取 loss registry 的 `use_topk`：
+
+```python
+distillation_use_topk = (
+    self.distillation_config.distillation_loss.loss_settings.use_topk
+)
+```
+
+随后把 `global_batch_size`、PPO epochs、shuffle、temperature 一并传给 actor：[`trainer_base.py` L1415–1445](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_base.py#L1415-L1445)。
+
+actor worker 进入：
+
+```text
+ActorRolloutRefWorker.update_actor
+  → TrainingWorker.train_mini_batch
+     → TrainingWorker.train_batch
+        → BaseEngine.train_batch(loss_function=distillation_ppo_loss)
+```
+
+RPC 与 worker 入口见 [`engine_workers.py` L233–377, L652–657](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine_workers.py#L233-L377)。
+
+## Step 8：`distillation_ppo_loss` 为什么有两个入口
+
+核心函数位于 [`trainer/distillation/losses.py` L165–222](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/losses.py#L165-L222)：
+
+```python
+if student_logits is not None:
+    # full logits 仍在：只计算 top-k 逐 token输出
+    return compute_topk_loss(...)
+
+# full logits 可释放：聚合最终 scalar
+distill_loss = distillation_loss(...)
+policy_loss = ppo_loss(...)
+...
+return policy_loss + coefficient * distill_loss
+```
+
+### sampled estimator
+
+只依赖 student 对实际 action 的 `log_probs` 与 teacher 对同一 action 的 `teacher_logprobs`，不需要读取 full vocab logits。因此只走最终 loss 入口。
+
+### `forward_kl_topk`
+
+必须从 student full logits 中按 teacher ids gather K 个 token。engine 因而先把 loss 函数当 **logits processor** 调一次，把这些逐 token 结果放进 `model_output`；最终阶段只聚合，不再保留 `[B,T,V]`。
+
+FSDP 接线：
+
+- [`fsdp/transformer_impl.py` L1167–1177](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine/fsdp/transformer_impl.py#L1167-L1177)
+- [`fsdp/transformer_impl.py` L1264–1274](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine/fsdp/transformer_impl.py#L1264-L1274)
+
+Megatron 接线：[`megatron/transformer_impl.py` L942–978](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine/megatron/transformer_impl.py#L942-L978)。
+
+## Step 9A：teacher-top-k forward KL
+
+令 $K_t=\operatorname{TopK}(p(\cdot\mid s_t))$，代码计算：
+
+$$
+\ell_t^{K}
+=
+\sum_{v\in K_t}
+p(v\mid s_t)
+\left[
+\log p(v\mid s_t)-\log q_\theta(v\mid s_t)
+\right].
+$$
+
+FSDP 实现：[`fsdp/losses.py` L75–149](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/fsdp/losses.py#L75-L149)。关键步骤：
+
+```python
+student_log_probs = log_softmax(student_logits)
+student_topk_log_probs = gather(student_log_probs, teacher_topk_ids)
+teacher_mass = exp(teacher_topk_log_probs).sum(-1)
+student_mass = exp(student_topk_log_probs).sum(-1)
+loss = sum(exp(teacher_logp) * (teacher_logp - student_logp), dim=-1)
+```
+
+### 它是截断近似，不是精确 full KL
+
+teacher top-k 概率没有重新归一化。令 $m_p=\sum_{v\in K_t}p(v)$，通常 $m_p\lt 1$。逐 token 截断和可能为负，最终 wrapper 会 `clamp_min(0.0)`：[`distillation/losses.py` L294–356](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/losses.py#L294-L356)。
+
+忽略 clamp 时，对 student logits 的梯度为：
+
+$$
+\frac{\partial\ell_t^K}{\partial z_j}
+=m_pq_j-p_j\mathbf 1[j\in K_t].
+$$
+
+Megatron 自定义 backward 直接实现这个公式：[`megatron/losses.py` L218–261](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/megatron/losses.py#L218-L261)。
+
+<Callout type="warn" title="正确组合">
+  <code>forward_kl_topk</code> 应配 <code>use_policy_gradient=false</code>。若把整个 top-k loss 当一个 sampled-token advantage，PPO 只能通过当前 action 的 $\nabla\log q(a)$ 更新，无法直接利用其他 K−1 个 token 的方向。
+</Callout>
+
+## Step 9B：sampled reverse-KL estimators
+
+令学生实际采到 $a\sim q$，并定义：
+
+$$
+d=\log q(a\mid s)-\log p(a\mid s).
+$$
+
+`kl_penalty()` 的代码值：
+
+| `loss_mode` | per-token 值 |
+|---|---|
+| `kl` / `k1` | $d$ |
+| `abs` | $|d|$ |
+| `mse` / `k2` | $\frac12 d^2$ |
+| `low_var_kl` / `k3` | $e^{-d}+d-1$ |
+
+源码：[`core_algos.py` L2126–2183](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/core_algos.py#L2126-L2183)。teacher/student response logprob 的 shape 对齐和调用见 [`distillation/losses.py` L359–394](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/losses.py#L359-L394)。
+
+### PG-OPD：k1 变成 stop-gradient advantage
+
+代码把：
+
+$$
+A_t=-\operatorname{sg}(d_t)
+$$
+
+传给 vanilla PPO loss：
+
+```python
+advantages = -distillation_losses.detach()
+ratio = exp(log_prob - old_log_prob)
+```
+
+源码：[`distillation/losses.py` L257–279](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/losses.py#L257-L279) 与 [`core_algos.py` L1278–1369](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/core_algos.py#L1278-L1369)。
+
+为什么必须 `detach`？teacher logprob 本来就是常量，但 `d` 里还有 current student logprob。如果 reward 本身也沿 student logprob 反传，就不再是 policy-gradient estimator。
+
+### Direct k3：不查 top-k 也能得到 GKD 方向
+
+$$
+k_3=e^{-d}+d-1=\frac{p(a)}{q(a)}+\log\frac{q(a)}{p(a)}-1.
+$$
+
+固定 rollout 样本直接反传：
+
+$$
+\nabla k_3
+=
+\left(1-\frac{p(a)}{q(a)}\right)\nabla\log q(a).
+$$
+
+对 $a\sim q$ 取期望：
+
+$$
+\mathbb E_q[\nabla k_3]
+=-\mathbb E_p[\nabla\log q(a)],
+$$
+
+即 forward KL $\mathrm{KL}(p\Vert q)$ 的梯度。它只让 teacher 返回 sampled-token logprob，通信便宜；但单样本方差与显式 top-k 分布信号不同。
+
+### 为什么 k1 不能 direct
+
+若直接反传 $d$：
+
+$$
+\nabla d=\nabla\log q(a),
+$$
+
+梯度与 teacher logprob 无关。配置因此直接禁止 `k1 + use_policy_gradient=false`：[`workers/config/distillation.py` L100–124](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L100-L124)。
+
+## Step 10：distillation 与 task loss 怎样相加
+
+最终函数先算两项：
+
+```python
+distill_loss = distillation_loss(...)
+policy_loss = ppo_loss(...)
+```
+
+再组合：
+
+$$
+\mathcal L=
+\begin{cases}
+\mathcal L_{policy}+\lambda\mathcal L_{distill}, & \text{use\_task\_rewards=true},\\
+\mathcal L_{distill}, & \text{use\_task\_rewards=false}.
+\end{cases}
+$$
+
+实现：[`distillation/losses.py` L207–222](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/losses.py#L207-L222)。
+
+三个容易漏掉的细节：
+
+1. `use_task_rewards=false` 时仍先计算 `ppo_loss`，再置零；
+2. 此时 `distillation_loss_coef` 被忽略，distill 系数等效为 1；
+3. actor 的 entropy bonus/reference KL 也属于整个 policy term，pure OPD 时会一起被丢弃，但前序计算可能已发生。
+
+## Step 11：response mask 与全局聚合
+
+direct GKD 用 `agg_loss()` 聚合逐 token loss；PG-OPD 的 clipped surrogate 也使用它。支持：
+
+- `token-mean`
+- `seq-mean-token-sum`
+- `seq-mean-token-sum-norm`
+- `seq-mean-token-mean`
+
+实现：[`core_algos.py` L1138–1199](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/core_algos.py#L1138-L1199)。
+
+engine 在切 micro-batches 前 all-reduce 全局有效 token 数：
+
+- FSDP：[`fsdp/transformer_impl.py` L638–652](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine/fsdp/transformer_impl.py#L638-L652)
+- Megatron：[`megatron/transformer_impl.py` L633–650](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine/megatron/transformer_impl.py#L633-L650)
+
+`response_mask` 是最终 loss mask；`loss_min/max` 在 `loss_max_clamp` **之前**计算，见 [`distillation/losses.py` L225–291](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/losses.py#L225-L291)。所以监控里的范围是 clamp 前值。
+
+## Step 12：三个 backend 怎样处理 top-k
+
+<Tabs items={['FSDP / FSDP2', 'Megatron', 'VeOmni fused']}>
+  <Tab value="FSDP / FSDP2">
+
+teacher top-k jagged tensor 先取 `.values()`，若 Ulysses SP 大于 1 就沿 sequence 切分。默认路径 materialize `log_softmax(student_logits)` 再按 teacher ids gather。
+
+[`fsdp/losses.py` L95–130](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/fsdp/losses.py#L95-L130)
+
+可选 `_chunked_topk_log_probs()` 逐 token chunk 做 fp32 `logsumexp + gather`，避免额外 `[B,T,V]` log-softmax buffer：[`fsdp/losses.py` L26–63](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/fsdp/losses.py#L26-L63)。它仍需要 student logits 本身。
+
+  </Tab>
+  <Tab value="Megatron">
+
+student vocab 被 TP 分片。每个 rank：
+
+1. TP all-reduce global max 与 exp sum，得到正确 vocab-parallel log-softmax；
+2. 只保留落入自己 vocab range 的 teacher ids；
+3. 本地 gather 后 all-reduce per-token KL/mass；
+4. 为 overlap 指标 all-gather 各 rank 的 local student top-k candidates。
+
+源码：[`megatron/losses.py` L27–216](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/megatron/losses.py#L27-L216)。teacher sequence 还会按 CP 的 THD/BSHD preprocess 切分：[`megatron/losses.py` L264–312](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/megatron/losses.py#L264-L312)。
+
+  </Tab>
+  <Tab value="VeOmni fused">
+
+VeOmni 把 teacher top-k ids/logprobs 直接交给 `chunk_topk_distill` fused causal-LM path，并按 Ulysses SP 同步切分。这样 lm-head projection 可分块计算，不必 materialize完整 `[B,L,V]` logits。
+
+源码：[`veomni/transformer_impl.py` L847–900](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine/veomni/transformer_impl.py#L847-L900)。官方解释写在 [`run_qwen3_0.6b_opd_veomni.sh` L4–15](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/examples/on_policy_distillation_trainer/run_qwen3_0.6b_opd_veomni.sh#L4-L15)。
+
+  </Tab>
+</Tabs>
+
+<Callout type="warn" title="不要随意给普通 FSDP/Megatron top-k 打开 fused kernels">
+  当前源码明确传入 teacher top-k fused 参数的是 VeOmni。普通 FSDP fused 分支只会读取已经存在的 VeOmni-style aux output；Megatron fused 分支没有调用 top-k logits processor。没有额外 kernel 证据时，普通 FSDP/Megatron 的 <code>forward_kl_topk</code> 先使用非 fused 路径。
+</Callout>
+
+## Step 13：反向、指标与权重同步
+
+`TrainingWorker`：
+
+- loss 在 DP group 做 AVG；
+- 其他 metrics 用 all-gather 聚合；
+- optimizer/LR scheduler 在 mini-batches 完成后推进。
+
+见 [`engine_workers.py` L172–231, L233–377](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/engine_workers.py#L172-L377)。
+
+默认 sync trainer 在 step 结束调用 checkpoint manager，把新 actor 权重推给 rollout replicas；见 [`trainer_sync.py` L31–42](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_sync.py#L31-L42)。下一轮 student rollout 才使用更新后的 policy。
+
+## 一份精简到可背诵的伪代码
+
+```python
+for prompts in dataloader:
+    responses = student_rollout.generate(prompts)          # states from student
+    sequence = concat(prompts, responses)
+
+    teacher_ids, teacher_logp = teacher.prompt_logprobs(   # teacher forcing
+        sequence,
+        topk=K if forward_kl_topk else 0,
+    )
+
+    batch = transfer_queue.sample()
+    old_logp = actor.response_logprobs(batch)
+    task_adv = compute_task_advantage(batch)                # still built in pure OPD
+
+    if forward_kl_topk:
+        per_token = sparse_forward_kl(
+            actor.full_logits(batch), teacher_ids, teacher_logp
+        )
+        distill_loss = masked_aggregate(per_token, response_mask)
+    elif use_policy_gradient:
+        d = current_sampled_logp - teacher_sampled_logp
+        distill_loss = ppo_surrogate(old_logp, advantage=-stop_grad(d))
+    else:
+        d = current_sampled_logp - teacher_sampled_logp
+        distill_loss = masked_aggregate(exp(-d) + d - 1, response_mask)
+
+    task_loss = ppo_loss(task_adv)
+    total = task_loss + coef * distill_loss if use_task_rewards else distill_loss
+    update_actor(total)
+    sync_actor_to_rollout()
+```
+
+## 读源码时的六个断点
+
+如果你要在 debugger/profiler 里设断点，先从这六处开始：
+
+1. `AgentLoopWorkerTQ._agent_loop_postprocess`：确认 rollout 输出、route 与 mask；
+2. `AgentLoopWorker._compute_teacher_logprobs`：确认 teacher 请求的完整 sequence；
+3. `AsyncTeacherLLMServerManager.compute_teacher_logprobs_single`：确认 `[S,1/K]`；
+4. `PPOTrainer._compute_old_log_prob`：确认 response causal slice；
+5. `PPOTrainer._update_actor`：确认 `distillation_use_topk` 和 batch metadata；
+6. `distillation_ppo_loss`：确认走 logits-processor 还是 final-loss 分支。
+
+## 读完后的自检
+
+<details>
+<summary>teacher trailing dummy 为什么安全？</summary>
+
+teacher rows 为了保持长度等于输入序列而在末尾补 dummy。response causal slice 只取 `[P-1:S-1]`，不包含最后 row，所以 dummy 永远不进入 response loss。
+
+</details>
+
+<details>
+<summary>为什么 tool token 要进 teacher input，却不进 loss？</summary>
+
+tool token 是后续 state 的一部分，删掉会让 teacher/student 条件前缀不同；但它不是 student action，所以 `response_mask=0`，只作上下文不作优化目标。
+
+</details>
+
+<details>
+<summary>为什么 top-k loss 要在 engine forward 中先算一次？</summary>
+
+它需要 student full vocab logits。若等到最终 scalar loss 阶段才算，full logits 可能已释放；inline logits processor 先产出少量 `[B,T]` 逐 token张量，降低峰值存活时间。
+
+</details>
+
+## 继续实践
+
+<Cards>
+  <Card title="选择配置与 backend" href="/docs/engineering/config-runbook">
+    把本章的代码分支翻译成可运行的 Hydra flags。
+  </Card>
+  <Card title="按症状排错" href="/docs/engineering/debugging">
+    loss 不对、teacher 卡住、OOM 或 MOPD route 报错时从哪里查。
+  </Card>
+  <Card title="设计第一次实验" href="/docs/practice/first-run">
+    先做 same-model plumbing baseline，再换强 teacher。
+  </Card>
+</Cards>

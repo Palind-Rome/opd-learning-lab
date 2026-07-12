@@ -1,0 +1,336 @@
+---
+title: KL 散度：目标与估计器
+description: 系统理解 Forward KL、Reverse KL、JSD、温度，以及 Tinker 如何用采样 token 估计 Reverse KL 梯度。
+---
+
+<Callout type="warn" title="最重要的阅读姿势">
+  每看到一个“KL loss”，先问四件事：在哪些前缀上算？KL 的方向是什么？是完整词表精确求和还是采样估计？最后用什么优化 loss 更新？把这四层混在一起，是理解 OPD 时最常见的错误。
+</Callout>
+
+本章会把下面四层彻底分开：
+
+1. **状态分布**：前缀来自固定数据还是当前学生；
+2. **数学目标**：forward KL、reverse KL 或 JSD；
+3. **估计器**：完整 logits、top-k 近似或 Monte Carlo token；
+4. **优化 loss**：交叉熵、importance sampling、PPO-style clipping 等。
+
+## 记号
+
+固定一个前缀：
+
+$$
+s_t=(x,y_{<t}).
+$$
+
+在这个前缀上：
+
+- 教师 next-token 分布记为 $q(a\mid s_t)$；
+- 学生 next-token 分布记为 $p_\theta(a\mid s_t)$；
+- $a$ 是词表中的一个 token。
+
+下面先把 $s_t$ 当作固定上下文，只讨论“同一个前缀上的两个分布如何靠近”。
+
+## Forward KL：覆盖教师的概率质量
+
+$$
+D_{\mathrm{KL}}(q\|p_\theta)
+=\sum_a q(a\mid s_t)\log\frac{q(a\mid s_t)}{p_\theta(a\mid s_t)}.
+$$
+
+它的期望权重来自教师 $q$。展开：
+
+$$
+D_{\mathrm{KL}}(q\|p_\theta)
+=\underbrace{\sum_a q(a)\log q(a)}_{\text{与学生参数无关}}
+-\sum_a q(a)\log p_\theta(a).
+$$
+
+所以在固定教师下，最小化 forward KL 等价于最小化教师 soft targets 对学生的交叉熵。
+
+### 直觉
+
+如果教师认为两个不同解法都合理，forward KL 会要求学生给两者都留出概率质量。学生漏掉任何教师高概率区域都会付出代价，因此它常被称为 **mode-covering** 或 **mean-seeking**。
+
+这对覆盖多种表达方式有价值，但当学生容量远小于教师时，“每一种都学一点”也可能让输出落在教师各个 mode 之间的低质量区域。GKD 用双峰分布说明了这种容量不足时的差异。[GKD §2](https://arxiv.org/pdf/2306.13649)
+
+### 与 SFT 的关系
+
+若从教师分布采样 token 或整条轨迹，再对这些 token 做 NLL，样本期望就是教师交叉熵，因此对应 forward-KL 目标。区别在于：
+
+- 完整 logits 使用教师的整个分布，信号更充分；
+- 单条采样序列是无偏但有方差的估计；
+- 有限固定数据会遗漏教师分布的一部分。
+
+## Reverse KL：压低教师不认可的学生行为
+
+$$
+D_{\mathrm{KL}}(p_\theta\|q)
+=\sum_a p_\theta(a\mid s_t)\log\frac{p_\theta(a\mid s_t)}{q(a\mid s_t)}
+=\mathbb E_{a\sim p_\theta}
+\left[\log p_\theta(a\mid s_t)-\log q(a\mid s_t)\right].
+$$
+
+它的期望权重来自学生 $p_\theta$。学生若给一个教师极不认可的 token 很高概率，会受到强烈惩罚；学生可以集中到教师的某个高质量 mode，而不必覆盖全部 mode。因此它常被称为 **mode-seeking**。
+
+代价是多样性可能下降。GKD 的结论不是“reverse KL 永远更好”，而是 divergence 的最佳选择依任务、学生容量与评估采样方式而变。[GKD §3.1](https://arxiv.org/pdf/2306.13649)
+
+## 一个三 token 玩具例子
+
+假设在同一个前缀上：
+
+| token | 教师 $q$ | 学生 $p$ |
+|---|---:|---:|
+| A | 0.80 | 0.45 |
+| B | 0.15 | 0.45 |
+| C | 0.05 | 0.10 |
+
+精确计算得到：
+
+$$
+D_{\mathrm{KL}}(q\|p)\approx 0.261\ \text{nats},
+\qquad
+D_{\mathrm{KL}}(p\|q)\approx 0.305\ \text{nats}.
+$$
+
+如果学生采到 A，Tinker 风格的逐 token advantage 是：
+
+$$
+A=\log q(A)-\log p(A)=\log 0.80-\log 0.45\approx 0.575,
+$$
+
+为正，应提高 A 的概率。如果采到 B：
+
+$$
+A=\log 0.15-\log 0.45\approx -1.099,
+$$
+
+为负，应压低 B 的概率。这不是说某个 token 自身“正确或错误”，而是说：**在当前前缀下，教师给它的相对概率比学生高还是低。**
+
+## Generalized JSD：在两种 KL 之间调节
+
+GKD 使用 generalized Jensen–Shannon divergence。令教师为 $q$、学生为 $p$：
+
+$$
+m_\beta=\beta q+(1-\beta)p,
+$$
+
+$$
+D_{\mathrm{JSD}(\beta)}(q\|p)
+=\beta D_{\mathrm{KL}}(q\|m_\beta)
++(1-\beta)D_{\mathrm{KL}}(p\|m_\beta),
+\qquad 0<\beta<1.
+$$
+
+它是有界的，即使两个分布的 support 不重合也不会像 KL 那样无界。GKD 引用的极限关系表明：
+
+- $\beta$ 接近 0 时，梯度行为更接近 forward KL；
+- $\beta$ 接近 1 时，梯度行为更接近 reverse KL。
+
+论文实验使用 forward KL、reverse KL，以及 JSD(0.1)、JSD(0.5)、JSD(0.9) 做系统消融。[GKD §2 与 §4](https://arxiv.org/pdf/2306.13649)
+
+| 差异度 | 主要期望来自 | 容量不足时的典型倾向 | 主要风险 |
+|---|---|---|---|
+| Forward KL $D(q\|p)$ | 教师 | 覆盖多个 mode | 分散到低质量区域 |
+| Reverse KL $D(p\|q)$ | 学生 | 集中到一个高质量 mode | 多样性下降、依赖学生有效 support |
+| JSD$(\beta)$ | 混合分布 | 在两者间调节 | 多一个任务相关超参 |
+
+## On-policy 是状态来源，不是 KL 方向
+
+GKD 把两个旋钮写得很清楚：
+
+$$
+\mathcal L_{\mathrm{GKD}}
+=(1-\lambda)\mathbb E_{(x,y)\sim(X,Y)}[D(q\|p_\theta)]
++\lambda\mathbb E_{x\sim X,\,y\sim p_S}[D(q\|p_\theta)].
+$$
+
+- $\lambda=0$：完全固定数据；
+- $\lambda=1$：完全学生 on-policy 数据；
+- $D$：可独立选择 forward KL、reverse KL 或 JSD。
+
+<Callout type="info" title="四种组合都说得通">
+  off-policy + forward KL、on-policy + forward KL、off-policy + reverse KL、on-policy + reverse KL 都是可定义的训练方案。只是计算代价、梯度估计方式与工程效果不同。
+</Callout>
+
+## Tinker 如何只查一个 token 仍优化 Reverse KL
+
+Thinking Machines 的基础 recipe 没有取得每个位置的完整词表 logits。它让学生采样 $a\sim p_\theta$，只查询这个 token 在学生与教师下的 log-prob。
+
+固定前缀上的 reverse KL 梯度是：
+
+$$
+\begin{aligned}
+\nabla_\theta D_{\mathrm{KL}}(p_\theta\|q)
+&=\nabla_\theta\sum_a p_\theta(a)
+\left(\log p_\theta(a)-\log q(a)\right)\\
+&=\mathbb E_{a\sim p_\theta}
+\left[
+\left(\log p_\theta(a)-\log q(a)+1\right)
+\nabla_\theta\log p_\theta(a)
+\right].
+\end{aligned}
+$$
+
+又因为 score-function identity：
+
+$$
+\mathbb E_{a\sim p_\theta}
+\left[\nabla_\theta\log p_\theta(a)\right]=0,
+$$
+
+常数 $+1$ 是零期望 baseline，可以去掉：
+
+$$
+\nabla_\theta D_{\mathrm{KL}}(p_\theta\|q)
+=\mathbb E_{a\sim p_\theta}
+\left[
+\left(\log p_\theta(a)-\log q(a)\right)
+\nabla_\theta\log p_\theta(a)
+\right].
+$$
+
+因此令：
+
+$$
+A(a)=\log q(a)-\log p_{\text{sample}}(a),
+$$
+
+再做 policy-gradient 更新，就得到固定前缀上 reverse-KL 梯度的 Monte Carlo 估计。
+
+源码正是这样写的：
+
+- <code>reverse_kl = sampled_logprobs - teacher_logprobs</code>：[train_on_policy.py L86–96](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L86-L96)；
+- <code>kl_advantages = -kl_penalty_coef * reverse_kl</code>：[train_on_policy.py L101–108](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L101-L108)。
+
+### “估计 KL”与“更新学生”的两个 ratio
+
+不要把下面两者混为一谈：
+
+| 量 | 公式 | 作用 |
+|---|---|---|
+| 教师监督 log-ratio | $\log p_{\text{sample}}-\log q_{\text{teacher}}$ | 构造 reverse-KL advantage |
+| learner/sampler importance ratio | $p_{\text{learner}}/p_{\text{sample}}$ | 修正训练模型与采样模型的小偏差 |
+
+Tinker 的 importance-sampling loss 是：
+
+$$
+\mathcal L_{\mathrm{IS}}
+=-\mathbb E_{a\sim p_{\text{sample}}}
+\left[
+\frac{p_{\text{learner}}(a)}{p_{\text{sample}}(a)}A(a)
+\right].
+$$
+
+官方实现与输入字段见 [Tinker Importance Sampling](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/)。
+
+<Cards>
+  <Card title="把它与 PPO ratio 对上" href="/docs/foundations/ppo-bridge">
+    PPO 也使用新旧策略 ratio，但教师 KL 与 trust-region KL 不是同一个对象。
+  </Card>
+  <Card title="去源码里看张量对齐" href="/docs/engineering/tinker-cookbook">
+    查看 mask、right shift、教师 log-prob 的切片对齐和实际训练循环。
+  </Card>
+</Cards>
+
+## 温度：至少有三种，不要混写
+
+给定 logits $z_i$，温度为 $T$ 的 softmax：
+
+$$
+p_i(T)=\frac{\exp(z_i/T)}{\sum_j\exp(z_j/T)}.
+$$
+
+- $T>1$：分布更平，低概率 token 更容易被采到；
+- $T<1$：分布更尖，更接近 greedy；
+- $T\to 0$：趋近 argmax。
+
+### 1. 学生 rollout 温度
+
+它决定学生访问哪些前缀。GKD 训练采样使用 $T=1$ 以保持多样性。Tinker 基础 recipe 的底层默认也是 1.0。
+
+### 2. 教师 target 温度
+
+它决定教师分布 $q$ 的尖锐程度。GKD 在 XSum 上观察到，当学生以温度 1 采样评估时，低于 1 的教师温度有时更好；这是特定任务的消融，不是普遍定律。[GKD Figure 7 与 Appendix A.3](https://arxiv.org/pdf/2306.13649)
+
+### 3. 评估温度
+
+它决定 accuracy、pass@k 和多样性的测量分布。当前 Tinker README 的 AIME'24 结果使用：
+
+~~~text
+temperature=1.0, top_p=1.0, top_k=-1, max_tokens=64000
+~~~
+
+来源：[Tinker Model Distillation recipe](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/)。
+
+<Callout type="warn" title="改变 rollout 温度会改变你估计的分布">
+  当采样分布被温度、top-k 或 top-p 改写时，sampled log-prob、访问到的状态和原始学生分布不再是同一件事。importance ratio 能修正 learner/sampler 的 action 概率差异，但 advantage 中也使用了 sampled log-prob；若要把结果仍解释为“未加温的精确 reverse KL”，必须重新推导。基础复现先保持 T=1、top-p=1、top-k=-1 最清楚。
+</Callout>
+
+经典 KD 有时会把高温 soft-target loss 乘以 $T^2$ 来校准梯度尺度。当前 Tinker 基础 OPD recipe 没有显式教师温度，也没有 $T^2$ rescaling；不要把其他 KD 配方的习惯自动套进来。
+
+## 即时 KL 与未来 KL
+
+一个 token 会改变未来前缀。若希望早期 token 为以后发生的 KL 负责，可以定义 return-to-go：
+
+$$
+G_t=\sum_{k\ge 0}\gamma^k(-\mathrm{KL}_{t+k}).
+$$
+
+Tinker 的 <code>kl_discount_factor</code>：
+
+- 默认 0.0：只用当前 token 的立即 KL；
+- 大于 0：把折扣后的未来 KL 加到更早 token 的 advantage。
+
+实现见 [discounted_future_sum_vectorized](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/metrics.py#L192-L211)。Thinking Machines 报告没有观察到正折扣因子的明显收益，因此 recipe 默认 0；这是实验选择，不代表未来 credit assignment 在数学上不存在。
+
+## 为什么日志里的 teacher KL 偶尔能小于 0？
+
+真正的 KL 散度满足非负性。但 Tinker 记录的是学生采样 token 上：
+
+$$
+\widehat D=\frac{1}{N}\sum_{i=1}^{N}
+\left(\log p(a_i)-\log q(a_i)\right).
+$$
+
+单个 token 的 log-ratio 可以为负，有限样本平均也可能暂时小于 0；只有在正确分布下取完整期望才保证非负。因此：
+
+- 看趋势和置信区间，不要因一个负 batch 立即判定公式错误；
+- 同时确认 mask、温度、top-k/top-p 与 teacher/student token 对齐；
+- 不要只看 training KL，必须看 held-out task metric。
+
+## 常见误区
+
+1. **Reverse KL 只是把 Forward KL 公式倒过来，效果差不多。**  
+   KL 不对称，期望权重与容量不足时的行为都不同。
+2. **On-policy 就意味着 Reverse KL。**  
+   前缀来源与 divergence 是独立轴。
+3. **Tinker 查询了完整 teacher logits。**  
+   基础 OPD recipe 只查询学生已采 token 的 teacher log-prob，再做 Monte Carlo policy-gradient 估计。
+4. **KL 真值非负，所以每个 token 的 log-ratio 也必须非负。**  
+   非负性只属于完整期望。
+5. **温度越低，training KL 越小，模型就越好。**  
+   低温可能只是缩窄了访问状态与输出多样性。
+
+## 自测
+
+1. Forward KL 的期望由教师还是学生加权？
+2. Tinker 中教师监督 log-ratio 与 learner/sampler importance ratio 各自解决什么问题？
+3. 为什么 reverse-KL 梯度推导中的 $+1$ 可以去掉？
+
+<details>
+<summary>查看答案</summary>
+
+1. 教师分布 $q$。
+2. 前者提供教师监督并构造 advantage；后者修正 learner 与 sampler 的策略偏差。
+3. 因为 $\mathbb E_{a\sim p}[\nabla\log p(a)]=0$，常数项是零期望 baseline。
+
+</details>
+
+## 一手资料
+
+- [GKD / On-Policy Distillation of Language Models](https://arxiv.org/abs/2306.13649)
+- [GKD ICLR 2024 PDF](https://arxiv.org/pdf/2306.13649)
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [Tinker — Importance Sampling](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/)
+- [Tinker — Loss Functions](https://tinker-docs.thinkingmachines.ai/tinker/losses/)
+

@@ -1,0 +1,400 @@
+---
+title: 第一次跑 OPD：两阶段最小实验
+description: 先用 same-model 证明数据与梯度链路，再换强 teacher 观察学习信号；给出 2-GPU 教学缩小版、验收标准和实验记录模板。
+---
+
+<Callout type="info" title="本章的目标不是刷新榜单">
+  第一次运行只回答两个问题：① teacher 信号是否沿正确 token、mask 与 loss 进入 student；②换成更强 teacher 后，student 是否得到有限、可解释的学习信号。先把实验压到 3–5 step，确认链路，再扩大模型、batch 和训练时长。
+</Callout>
+
+## 为什么要分两阶段
+
+直接用“小 student + 大 teacher”启动失败时，你无法判断是能力差、tokenizer 错、teacher server 错，还是 causal shift 错。
+
+```text
+阶段 A：student checkpoint == teacher checkpoint
+  目的：验证 plumbing
+  预期：蒸馏 loss 接近 0，数值有限，token/mask/teacher 请求都正常
+
+阶段 B：student = 0.6B，teacher = 1.7B（同模型家族）
+  目的：验证真实学习信号
+  预期：loss 与梯度有限且非零；短跑不要求 task accuracy 立刻提升
+```
+
+<OPDCycle />
+
+same-model loss **不应被要求精确为 0**。student 训练 forward 与 teacher 推理引擎可能使用不同 dtype、kernel、log-softmax 实现；verl 官方文档也把“同模型应接近 0”作为 sanity check，而不是等式保证，见 [`docs/algo/opd.md` L611–613](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/docs/algo/opd.md#L611-L613)。
+
+## 先选一条最小路径
+
+本章使用：
+
+| 维度 | 第一次运行的选择 | 原因 |
+|---|---|---|
+| trainer | V1 `sync` | 最接近严格 on-policy，先排除 staleness |
+| backend | FSDP + vLLM | 通用、与官方 text baseline 同一路径 |
+| 算法 | `k1 + policy gradient` | teacher 每位置只回 sampled token logprob，通信与显存较小 |
+| task reward | 关闭 | 先隔离蒸馏链路；当前 pipeline 仍会产生 reward/advantage 字段 |
+| reference KL | 关闭 | 避免第三个 reference 分布干扰 |
+| 数据 | GSM8K，小 batch | 官方 preprocessing 与 reward schema 完整，容易检查 |
+| teacher | 同家族 Qwen3 | 原生管线要求 token id 语义兼容 |
+| logger | console | 先减少外部依赖 |
+
+canonical 组合来自官方 FSDP 示例：[`run_qwen3_8b_fsdp.sh` L6–29、L79–116](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/examples/on_policy_distillation_trainer/run_qwen3_8b_fsdp.sh#L6-L29)。该脚本的正式默认是 Qwen3-8B student、Qwen3-32B teacher，global pool 8 GPU 加 teacher pool 4 GPU；本章为了教学缩到 0.6B 和两张 GPU。
+
+<Callout type="warn" title="2-GPU 是教学缩小版，不是仓库认证 preset">
+  verl 仓库中明确给出的 0.6B 小模型 VeOmni 示例仍是 <strong>7 张 global-pool GPU + 1 张 teacher GPU</strong>。下面的 FSDP <strong>1 + 1</strong> 配置用于快速 plumbing 实验，是否装得下取决于 GPU 显存、PyTorch/vLLM 版本和碎片化；它不能替代你所在集群的容量评估。
+</Callout>
+
+如果只有一张 GPU，不建议把 actor/rollout 与独立 teacher server 强塞在同一设备后据此判断框架正确性。更稳妥的是先做离线数学单测，或临时申请第二张 GPU；当前原生配置把 global pool 与 teacher pool 作为相加的独立资源。
+
+## 阶段 0：环境与数据预检
+
+### 0.1 固定源码版本
+
+本网站走读的是：
+
+```bash
+git clone https://github.com/verl-project/verl.git
+cd verl
+git checkout 1ff76cc625e9820d2434dad1b6d9b8e5dd26a359
+```
+
+安装请按该 commit 的 [`README`](https://github.com/verl-project/verl/tree/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359) 与所选 backend 文档完成。不要把“最新 main 的依赖”与这个固定源码混装后，仍把报错归因于本章。
+
+至少记录：
+
+```bash
+git rev-parse HEAD
+python -V
+python -c "import torch, ray, vllm; print(torch.__version__, ray.__version__, vllm.__version__)"
+nvidia-smi
+```
+
+### 0.2 准备 GSM8K parquet
+
+官方脚本会生成 `~/data/gsm8k/train.parquet` 和 `test.parquet`：
+
+```bash
+python examples/data_preprocess/gsm8k.py \
+  --local_save_dir "$HOME/data/gsm8k"
+```
+
+预处理源码把每条样本变成 `prompt`、`data_source=openai/gsm8k`、`reward_model` 和 `extra_info`，见 [`gsm8k.py` L48–105](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/examples/data_preprocess/gsm8k.py#L48-L105)。即使 pure OPD 把 task policy loss 置零，当前 trainer 仍经过 reward/advantage 管线，因此不要随手删掉这些字段。
+
+<details>
+  <summary>快速检查 parquet schema</summary>
+
+```bash
+python - <<'PY'
+import pandas as pd
+
+p = f"{__import__('os').path.expanduser('~')}/data/gsm8k/train.parquet"
+df = pd.read_parquet(p)
+print(df.columns.tolist())
+print(df.iloc[0][["data_source", "prompt", "reward_model"]])
+PY
+```
+
+应至少看到 `data_source`、`prompt`、`reward_model`。MOPD 以后默认用 `data_source` 路由 teacher；第一次单 teacher 实验虽然不会依赖路由值，也应保留它。
+
+</details>
+
+### 0.3 做 tokenizer 兼容表
+
+阶段 A 同 checkpoint，天然降低了 token-space 风险；阶段 B 仍要记录：
+
+| 项目 | student | teacher | 必须相同？ |
+|---|---|---|---|
+| tokenizer repo + revision |  |  | 是，或你能证明 id 语义等价 |
+| `vocab_size` |  |  | teacher ids 必须可被 student gather |
+| BOS / EOS / PAD ids |  |  | 是 |
+| chat template |  |  | 建议相同 |
+| multimodal special ids | 不适用 | 不适用 | VL 实验必须核对 |
+
+原生路径把 student ids 原样送给 teacher，再把 teacher global vocab ids交给 student gather；见 [`agent_loop.py` L1016–1020](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/agent_loop/agent_loop.py#L1016-L1020) 与 [`fsdp/losses.py` L115–124](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/fsdp/losses.py#L115-L124)。只比较 vocab 数量不够。
+
+## 阶段 A：same-model plumbing baseline
+
+### 资源假设
+
+- 1 个节点、2 张 NVIDIA GPU；
+- GPU 0 属于 student 的 global pool，actor/rollout colocate；
+- GPU 1 属于 teacher pool；
+- Qwen3-0.6B 同时作为 student 与 teacher；
+- 最大 prompt 512、response 256，batch 先取 2；
+- 只跑 3 step，不保存、不验证。
+
+global pool 与 teacher pool 是独立资源，总需求是 `1 + 1 = 2 GPU`，而不是只看 `trainer.n_gpus_per_node=1`。teacher pool 的创建入口见 [`trainer_base.py` L615–624](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/ppo/v1/trainer_base.py#L615-L624)。
+
+### 从官方脚本做最小覆盖
+
+```bash
+STUDENT_MODEL=Qwen/Qwen3-0.6B \
+TEACHER_MODEL=Qwen/Qwen3-0.6B \
+NNODES=1 \
+NGPUS_PER_NODE=1 \
+TEACHER_WORLD_SIZE=1 \
+ROLLOUT_TP=1 \
+TEACHER_TP=1 \
+TRAIN_BATCH_SIZE=2 \
+PPO_MINI_BATCH_SIZE=2 \
+MAX_PROMPT_LENGTH=512 \
+MAX_RESPONSE_LENGTH=256 \
+PPO_MAX_TOKEN_LEN_PER_GPU=2048 \
+ROLLOUT_GPU_MEM_UTIL=0.25 \
+TEACHER_GPU_MEM_UTIL=0.35 \
+ACTOR_LR=1e-6 \
+SAVE_FREQ=-1 \
+TEST_FREQ=-1 \
+bash examples/on_policy_distillation_trainer/run_qwen3_8b_fsdp.sh \
+  data.train_files="$HOME/data/gsm8k/train.parquet" \
+  data.val_files="$HOME/data/gsm8k/test.parquet" \
+  data.shuffle=True \
+  trainer.logger=console \
+  trainer.total_training_steps=3 \
+  trainer.v1.trainer_mode=sync \
+  distillation.teacher_models.teacher_model.inference.temperature=1.0 \
+  actor_rollout_ref.actor.use_torch_compile=False
+```
+
+<Callout type="warn" title="不要复制后立刻跑长任务">
+  先在你当前 commit 上执行 <code>bash -n</code> 检查脚本，再让 Hydra 打印 resolved config。若 0.6B 在 1 张 actor GPU 上仍 OOM，先把 batch 降到 1、response 降到 128、token budget 降低并保留 offload；不要把 teacher pool 改成 0，也不要以牺牲 tokenizer 正确性来换模型更小。
+</Callout>
+
+这个命令沿用官方脚本中的 `k1 + PG`、`use_task_rewards=False`、reference KL 关闭、FSDP param/optimizer offload 和 teacher temperature 默认值。官方脚本源码见 [`run_qwen3_8b_fsdp.sh`](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/examples/on_policy_distillation_trainer/run_qwen3_8b_fsdp.sh)。
+
+### 启动前读 resolved config
+
+逐项确认：
+
+```text
+trainer.use_v1                         = true
+trainer.v1.trainer_mode                = sync
+trainer.n_gpus_per_node × nnodes       = 1
+distillation.enabled                   = true
+distillation.n_gpus_per_node × nnodes  = 1
+teacher inference TP                   = 1
+teacher inference temperature          = 1.0
+teacher max_model_len                  ≥ 512 + 256 + 1
+loss_mode                              = k1
+use_policy_gradient                    = true
+use_task_rewards                       = false
+algorithm.use_kl_in_reward             = false
+actor.use_kl_loss                      = false
+```
+
+teacher 的 `+1` 来自请求会在完整 `prompt + response` 后再生成一个占位 token；源码配置检查见 [`distillation.py` L172–185](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/config/distillation.py#L172-L185)。prompt-logprob 接口要求 teacher temperature 恰为 1.0，见 [`teacher_manager.py` L30–43](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/experimental/teacher_loop/teacher_manager.py#L30-L43)。
+
+### 阶段 A 验收标准
+
+| 检查 | 通过 | 不通过时先做什么 |
+|---|---|---|
+| teacher server | 每 step 都完成 prompt-logprob 请求，无长时间单侧等待 | 核对 pool、temperature、context 与 health log |
+| token 数 | `response_mask.sum() > 0`，不超过实际 response token 数 | 打印一条短样本，检查 causal shift 与 pad/tool mask |
+| 数值 | `actor/distillation/loss`、`abs_loss`、grad norm 均有限 | 保存首个 NaN token/logprob；减小 batch；核对 clamp |
+| same-model gap | loss 在小范围内围绕 0，而不是稳定大偏差 | 检查 tokenizer、temperature、engine dtype 与 response slice |
+| 更新 | backward/optimizer step 完成 | 检查 loss 是否接图、PG 组合与参数 requires-grad |
+
+“小范围”没有跨硬件统一阈值。正确做法是：固定 seed 和输入，重复 3–5 次，先得到你这套 engine/dtype 的 same-model 噪声地板；阶段 B 的 teacher gap 应显著高于这个基线。不要为了通过验收而随意放宽到任意大 loss。
+
+### 建议额外打印一条样本
+
+```text
+prompt token ids
+response token ids
+response_mask
+teacher sampled-token logprobs
+student logprobs
+per-token distillation loss
+```
+
+对 response 第一个 token，teacher 分布必须来自 prompt 最后一个 causal 位置。verl 的 response 提取使用 `[P-1:S-1]`，见 [`padding.py` L129–143](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/workers/utils/padding.py#L129-L143)。如果同模型仍有稳定大偏差，这一行通常比全局 loss 更快暴露问题。
+
+## 阶段 B：换成更强 teacher
+
+阶段 A 通过后，只改 teacher checkpoint 和实验名，其余保持不变：
+
+```bash
+STUDENT_MODEL=Qwen/Qwen3-0.6B \
+TEACHER_MODEL=Qwen/Qwen3-1.7B \
+NNODES=1 \
+NGPUS_PER_NODE=1 \
+TEACHER_WORLD_SIZE=1 \
+ROLLOUT_TP=1 \
+TEACHER_TP=1 \
+TRAIN_BATCH_SIZE=2 \
+PPO_MINI_BATCH_SIZE=2 \
+MAX_PROMPT_LENGTH=512 \
+MAX_RESPONSE_LENGTH=256 \
+PPO_MAX_TOKEN_LEN_PER_GPU=2048 \
+ROLLOUT_GPU_MEM_UTIL=0.25 \
+TEACHER_GPU_MEM_UTIL=0.35 \
+ACTOR_LR=1e-6 \
+EXPERIMENT_NAME=qwen3_0.6b_from_1.7b_k1_pg_smoke \
+SAVE_FREQ=-1 \
+TEST_FREQ=-1 \
+bash examples/on_policy_distillation_trainer/run_qwen3_8b_fsdp.sh \
+  data.train_files="$HOME/data/gsm8k/train.parquet" \
+  data.val_files="$HOME/data/gsm8k/test.parquet" \
+  data.shuffle=True \
+  trainer.logger=console \
+  trainer.total_training_steps=5 \
+  trainer.v1.trainer_mode=sync \
+  distillation.teacher_models.teacher_model.inference.temperature=1.0 \
+  actor_rollout_ref.actor.use_torch_compile=False
+```
+
+如果 1.7B teacher 在单卡 server 侧 OOM，降低 teacher `gpu_memory_utilization` 并不能解决模型权重本身装不下的问题。应换显存更大的卡、启用合适 TP 并增加 teacher pool，或先用更小的同家族 checkpoint；teacher world size 必须满足 `replicas × TP × DP × PP` 的精确资源等式。
+
+### 阶段 B 不要求什么
+
+- 不要求 5 step 后 GSM8K accuracy 显著上升；
+- 不要求 sampled k1 loss 每一步单调下降；
+- 不要求与另一台机器的绝对 loss 数值一致；
+- 不要求 rollout 文本立即“像 teacher”。
+
+OPD 的训练分布随 student 更新而变化；k1 又是 sampled-action estimator，单步正负和方差都可能较大。短跑验收的是**信号链路**：loss 相对 same-model 噪声地板明显、有限，gradient 非零且 optimizer 能更新。
+
+### 阶段 B 真正要看什么
+
+1. `actor/distillation/loss` 与 `actor/distillation/abs_loss`；
+2. actor grad norm、learning rate、optimizer step 是否有限；
+3. `pg_clipfrac` 与 `ppo_kl` 是否一开始就异常高；
+4. 每 step response 有效 token 数与截断率；
+5. teacher 请求 latency、actor 等待占比；
+6. 固定 held-out prompts 上的 task accuracy / reward；
+7. 定期重新跑同一 evaluation，而不是拿变化中的训练 batch 自比。
+
+loss 的聚合和指标写入见 [`distillation/losses.py` L214–220、L386–393](https://github.com/verl-project/verl/blob/1ff76cc625e9820d2434dad1b6d9b8e5dd26a359/verl/trainer/distillation/losses.py#L214-L220)。PG 的 clip / KL 指标来自同一 distillation loss 分支；如果第一步 clipfrac 已接近饱和，先减学习率、actor epochs 或 mini-batch 更新强度。
+
+## 从 smoke test 升级成学习实验
+
+smoke test 通过后，不要一次改十项。推荐每轮只增加一个变量：
+
+```text
+same-model 3 step
+  ↓ 只换 teacher
+0.6B ← 1.7B，5 step
+  ↓ 只增加步数 + 固定 evaluation
+短程 k1 PG baseline
+  ↓ 只增加 batch / token budget
+稳定吞吐 baseline
+  ↓ 再比较算法
+forward_kl_topk + direct
+  ↓ 再混合目标
+task reward + OPD
+  ↓ 再扩系统
+MOPD → async / fully async
+```
+
+### 算法对照：top-k direct
+
+在 k1 baseline 稳定后，可以保持模型、数据和同步模式不变，只改：
+
+```bash
+DISTILLATION_LOSS_MODE=forward_kl_topk \
+USE_POLICY_GRADIENT=False \
+DISTILLATION_TOPK=32 \
+bash examples/on_policy_distillation_trainer/run_qwen3_8b_fsdp.sh \
+  actor_rollout_ref.model.use_fused_kernels=False \
+  distillation.distillation_loss.use_chunked_topk=True \
+  ...
+```
+
+这里的 `...` 表示复用阶段 B 的其余覆盖，不是可以原样执行的 shell 参数。普通 FSDP top-k 先关闭无明确接线证据的 fused path；若 `[B,T,V]` log-softmax OOM，再使用 chunked top-k 或迁移到官方 VeOmni fused 示例。top-k 还必须同时记录 `teacher_mass`、`student_mass` 与 `overlap_ratio`，因为它是 teacher top-k 支持上的截断近似，不是 full KL。
+
+## 实验记录模板
+
+复制一份表格到实验日志；每次只填事实，不用“看起来还行”。
+
+| 字段 | 阶段 A | 阶段 B |
+|---|---|---|
+| date / owner |  |  |
+| verl commit |  |  |
+| launch command hash / 文件 |  |  |
+| GPU 型号与数量 |  |  |
+| student / revision |  |  |
+| teacher / revision |  |  |
+| tokenizer / revision |  |  |
+| train / val 数据 hash |  |  |
+| backend / rollout engine |  |  |
+| trainer mode | sync | sync |
+| loss mode / PG / top-k | k1 / true / — | k1 / true / — |
+| prompt / response limits |  |  |
+| global / teacher pool | 1 / 1 | 1 / 1 |
+| first-step distill loss |  |  |
+| mean abs loss |  |  |
+| grad norm range |  |  |
+| PG clipfrac / PPO KL |  |  |
+| response valid tokens |  |  |
+| teacher latency |  |  |
+| task metric before / after |  |  |
+| conclusion | plumbing pass/fail | signal pass/fail |
+
+### 最小结论句式
+
+```text
+在 commit ______、Qwen3-0.6B same-model、FSDP/vLLM sync、k1-PG 下，
+3 step 的 distillation loss 为 ______，abs_loss 为 ______，grad norm 为 ______；
+token/mask 抽样核对 ______，因此 plumbing [通过/未通过]。
+
+只把 teacher 换成 Qwen3-1.7B 后，loss 相对噪声地板 ______，
+5 step 内数值 [有限/非有限]、gradient [非零/为零]；
+这证明 ______，但尚不能证明长期 task quality 提升。
+```
+
+这种写法把“管线工作”“存在学习信号”“最终能力提升”分成三个不同主张，避免用一个 loss 曲线替代全部证据。
+
+## 常见失败的最短处理
+
+<Tabs items={['启动即失败', 'teacher 卡住', 'same-model 偏差大', 'OOM', '跑完却无结论']}>
+  <Tab value="启动即失败">
+
+先核对两个 pool 都是正数；teacher world size 是否精确等于 `replicas × TP × DP × PP`；context 是否有 `+1`；temperature 是否为 1.0。保留第一处 traceback。
+
+  </Tab>
+  <Tab value="teacher 卡住">
+
+看 server model load、health log、单请求 latency 和 in-flight 分布。当前原生 teacher 是逐样本 generate + asyncio/replicas 并发，不存在一个可随手增大的原生 `teacher_batch_size`。
+
+  </Tab>
+  <Tab value="same-model 偏差大">
+
+先查 tokenizer revision、special ids、teacher temperature、response causal slice 与 mask，再比较 dtype/kernel。不要先用更大 clamp 把问题藏起来。
+
+  </Tab>
+  <Tab value="OOM">
+
+先把 batch 降到 1、response 降到 128、token budget 降低，保留 FSDP offload；确认能走完一 step 后再逐项加回。top-k OOM 另用 chunked / VeOmni 路径。
+
+  </Tab>
+  <Tab value="跑完却无结论">
+
+补 same-model 噪声地板、固定 held-out evaluation、grad norm 和 token/mask 抽样。仅有“5 step loss 下降/上升”不足以判断 OPD 是否有效。
+
+  </Tab>
+</Tabs>
+
+## 完成标准
+
+第一次实验可以结束于以下明确状态之一：
+
+- **Plumbing pass：** same-model 请求、对齐、loss、backward 均正常，loss 接近本机数值噪声地板；
+- **Signal pass：** 更强 teacher 相对 same-model 产生显著、有限、非零的 distillation signal；
+- **Learning pass：** 扩大到预注册训练预算后，固定 held-out task metric 相对 student-only / 初始 checkpoint 改善，并报告方差；
+- **Blocked：** 给出最早失败层、完整证据包和下一项唯一对照实验。
+
+前三者不能互相替代。把 plumbing pass 写成“OPD 提升了推理能力”，和把 5-step loss 波动写成“算法失败”，都是过度结论。
+
+<Cards>
+  <Card title="看懂每一步源码" href="/docs/engineering/verl-codewalk">
+    追踪 rollout、teacher prompt-logprob、dummy row、causal shift 与三类 loss。
+  </Card>
+  <Card title="按硬件改配置" href="/docs/engineering/config-runbook">
+    选择 teacher 拓扑、FSDP/Megatron/VeOmni、MOPD 与 async。
+  </Card>
+  <Card title="遇到异常时分诊" href="/docs/engineering/debugging">
+    从启动约束到 OOM、指标语义和 staleness，建立证据链。
+  </Card>
+</Cards>

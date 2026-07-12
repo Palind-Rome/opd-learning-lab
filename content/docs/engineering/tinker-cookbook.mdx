@@ -1,0 +1,480 @@
+---
+title: Tinker Cookbook 源码导读
+description: 从 SFT 初始化到学生 rollout、教师打分、KL advantage、importance sampling 与 sampler 刷新，逐行读懂官方 OPD recipe。
+---
+
+<Callout type="info" title="版本化阅读">
+  本章逐行核验的是本地 tinker-cookbook 提交 <code>b939b4f3c14502e84c60e05e560ef93b9da31baf</code>（提交日期 2026-06-26）。源码会演进；文中指出的默认值、行号和 temperature 接线缺口都只对该提交负责。
+</Callout>
+
+本章沿着一条训练样本的生命周期追踪：
+
+~~~text
+SFT checkpoint
+  → prompt-only dataset
+  → 最新学生 rollout
+  → Datum 与 mask
+  → 固定教师 log-prob
+  → reverse-KL advantage
+  → importance-sampling update
+  → 新学生 sampler
+~~~
+
+<Cards>
+  <Card title="先补状态分布" href="/docs/foundations/why-on-policy">
+    不清楚 rollout、prefix 与 exposure bias 时，先读这一章。
+  </Card>
+  <Card title="先补 KL 推导" href="/docs/foundations/kl-divergence">
+    不清楚为什么只查一个 token 也能估计 reverse-KL 梯度时，从这里开始。
+  </Card>
+  <Card title="理解与 PPO 的关系" href="/docs/foundations/ppo-bridge">
+    区分 teacher KL、importance ratio 与 PPO clipping。
+  </Card>
+</Cards>
+
+## 源码地图
+
+固定提交入口：  
+[thinking-machines-lab/tinker-cookbook@b939b4f](https://github.com/thinking-machines-lab/tinker-cookbook/tree/b939b4f3c14502e84c60e05e560ef93b9da31baf)
+
+| 作用 | 本地相对路径 | 关键行 |
+|---|---|---:|
+| 单轮 OPD CLI | <code>tinker_cookbook/recipes/distillation/on_policy_distillation.py</code> | 50–181 |
+| 核心 OPD 循环 | <code>tinker_cookbook/distillation/train_on_policy.py</code> | 53–514 |
+| prompt-only 数据与环境 | <code>tinker_cookbook/distillation/datasets.py</code> | 32–276 |
+| rollout 转训练 Datum | <code>tinker_cookbook/rl/data_processing.py</code> | 23–224 |
+| RL loss 调用与 optimizer | <code>tinker_cookbook/rl/train.py</code> | 265–362 |
+| reasoning SFT 初始化 | <code>tinker_cookbook/recipes/distillation/off_policy_reasoning.py</code> | 43–198 |
+| 复现命令与作者结果 | <code>tinker_cookbook/recipes/distillation/README.md</code> | 1–160 |
+
+直接入口：
+
+- [单轮 OPD CLI](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/on_policy_distillation.py#L50-L181)
+- [核心训练循环](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L53-L514)
+- [数据集与环境](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/datasets.py#L32-L276)
+- [Datum 构造](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/data_processing.py#L23-L224)
+- [train_step](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/train.py#L265-L362)
+
+## 官方 reasoning 配方其实有两阶段
+
+当前 cookbook 推荐：
+
+~~~text
+阶段 A：OpenThoughts3 上做 SFT
+阶段 B：DeepMath prompts 上做 OPD
+~~~
+
+### 阶段 A：hard-target SFT
+
+<code>off_policy_reasoning.py</code>：
+
+1. 流式读取 <code>open-thoughts/OpenThoughts3-1.2M</code>：  
+   [L43–55](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/off_policy_reasoning.py#L43-L55)
+2. 把数据的 <code>human/gpt</code> 角色映射成 <code>user/assistant</code>，默认训练 assistant messages：  
+   [L57–76](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/off_policy_reasoning.py#L57-L76)
+3. 默认 rank-128 LoRA、batch 128、LR 1e-3、最大长度 16384：  
+   [L90–109](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/off_policy_reasoning.py#L90-L109)
+4. 最终调用通用 supervised trainer：  
+   [L160–198](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/off_policy_reasoning.py#L160-L198)
+
+这条 README 复现路径里的“off-policy distillation”是教师生成 reasoning traces 上的 sequence-level hard-target SFT。
+
+<Callout type="warn" title="不要和另一个 off-policy trainer 混淆">
+  仓库还存在 <code>tinker_cookbook/distillation/train_off_policy.py</code>：它在固定 SFT 数据的每个位置查询教师 top-k soft targets，默认 top-20，在 top-k 内重归一化后做 cross-entropy。README 的 reasoning 命令没有调用它。
+</Callout>
+
+soft-target trainer 的证据：
+
+- 模块对 on/off-policy 的定义：[train_off_policy.py L1–15](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_off_policy.py#L1-L15)
+- top-k 收集、对齐与重归一化：[L139–225](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_off_policy.py#L139-L225)
+- cross-entropy 更新：[L447–465](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_off_policy.py#L447-L465)
+
+## CLI 如何变成完整 Config
+
+单轮入口的 <code>CLIConfig</code> 分为：
+
+| 类别 | 关键字段 |
+|---|---|
+| 学生 | <code>model_name</code>、<code>lora_rank</code>、<code>load_checkpoint_path</code> |
+| 教师 | <code>teacher_model</code>、<code>teacher_checkpoint</code> |
+| 数据 | <code>dataset</code>、<code>group_size</code>、<code>groups_per_batch</code> |
+| rollout | <code>max_tokens</code>、<code>temperature</code> |
+| KL | <code>kl_penalty_coef</code>、<code>kl_discount_factor</code> |
+| 更新 | <code>learning_rate</code>、<code>loss_fn</code>、<code>num_substeps</code> |
+
+定义见 [on_policy_distillation.py L50–99](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/on_policy_distillation.py#L50-L99)。
+
+入口随后解析 renderer，创建 <code>PromptOnlyDatasetBuilder</code> 与 <code>TeacherConfig</code>，再创建底层 <code>train_on_policy.Config</code> 并调用 <code>main()</code>。[L102–181](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/on_policy_distillation.py#L102-L181)
+
+## 第 1 步：数据集只提供 prompt，不提供 reward
+
+### PromptOnlyEnv
+
+<code>PromptOnlyEnv</code>：
+
+- <code>check_format()</code> 恒为 true；
+- <code>check_answer()</code> 恒为 false；
+- <code>step()</code> 返回 reward 0.0，立即结束 episode。
+
+源码：[datasets.py L85–121](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/datasets.py#L85-L121)。
+
+这证明基础 OPD recipe 没有混入 math correctness reward 或格式奖励。**唯一训练信号来自教师 KL。**
+
+### DeepMath 与 Tulu3
+
+- DeepMath 读取每行的 <code>question</code> 字段：[L180–189](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/datasets.py#L180-L189)
+- Tulu3 只取第一个 user message：[L192–218](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/datasets.py#L192-L218)
+- prompt 默认截到 1024 tokenizer tokens：[L221–256](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/datasets.py#L221-L256)
+
+所以基础 Tulu3 recipe 是单轮训练。多轮工具使用是另一条 Harbor recipe。
+
+### group_size 真正做什么
+
+每个 prompt 构造一个 group，<code>num_envs=group_size</code>：[datasets.py L158–174](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/datasets.py#L158-L174)
+
+通用 RL 代码先把同 prompt 的 rewards 居中：
+
+$$
+A_i=R_i-\frac{1}{G}\sum_jR_j.
+$$
+
+但这里所有 $R_i=0$，所以初始环境 advantage 全为 0。[data_processing.py L23–42](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/data_processing.py#L23-L42)
+
+循环设置 <code>do_remove_constant_reward_groups=False</code>，保留这些组，随后加入 KL advantage。[train_on_policy.py L321–338](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L321-L338)
+
+所以 <code>group_size=4</code> 主要表示每 prompt 采 4 条轨迹，用于增加覆盖与降低采样方差；即使 <code>group_size=1</code>，教师 KL 仍能给梯度。
+
+## 第 2 步：创建学生和固定教师
+
+### 学生 TrainingClient
+
+底层 <code>main()</code> 有三条初始化路径：
+
+1. 从当前 log 目录 resume：加载权重和 optimizer state；  
+   [train_on_policy.py L399–425](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L399-L425)
+2. 用 <code>load_checkpoint_path</code> 开新 run：只加载权重，使用新 optimizer；  
+   [L426–434](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L426-L434)
+3. 没有 checkpoint：创建 LoRA training client；  
+   [L435–438](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L435-L438)
+
+对复现实验来说，<code>load_checkpoint_path</code> 指向阶段 A 的学生 SFT 权重，不是 teacher checkpoint。
+
+### 教师 SamplingClient
+
+每个 dataset config 对应一个教师。若给 <code>teacher_checkpoint</code>，以 base model 加 model path 创建；否则只用 base model。教师只做 log-prob inference，没有 backward 和 optimizer。[train_on_policy.py L443–472](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L443-L472)
+
+<Callout type="warn" title="Tokenizer / renderer 必须兼容">
+  当前实现把学生构造出的 token 序列直接送给教师。源码明确提醒：若教师 renderer 与学生不同，需要改造 teacher 输入。不要随意把 token ID 空间不同的两个模型拼在一起。
+</Callout>
+
+对应注释：[train_on_policy.py L72–73](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L72-L73)。
+
+## 第 3 步：用最新学生生成 rollout
+
+同步训练开始时先保存权重并获得 sampling client：[train_on_policy.py L299–302](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L299-L302)
+
+每个 batch 并发执行 group rollout，使用 <code>config.temperature</code> 和 <code>config.max_tokens</code>，并记录每个学生 token 的 sampling log-prob。[L306–343](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L306-L343)
+
+## 第 4 步：Trajectory 如何变成 Datum
+
+<code>trajectory_to_data()</code> 把 observation 与 action 拼成序列：
+
+| token 来源 | sampled log-prob | 初始 advantage | mask |
+|---|---:|---:|---:|
+| prompt / 环境 observation | 0 | 0 | 0 |
+| 学生生成 action | rollout 中记录 | trajectory advantage | 1 |
+
+源码：[data_processing.py L95–190](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/data_processing.py#L95-L190)，尤其 [L138–185](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/data_processing.py#L138-L185)。
+
+随后做 next-token shift：
+
+~~~text
+完整 token:   [x0, x1, x2, x3]
+model_input:  [x0, x1, x2]
+targets:      [x1, x2, x3]
+~~~
+
+prompt 作为上下文进入模型，但 mask 为 0；只有学生生成 token 接收 KL 梯度。
+
+## 第 5 步：教师 log-prob 为何切 [1:]
+
+一个 Datum 有 $N$ 长的 <code>model_input</code> 和 $N$ 个 targets。源码：
+
+1. 给 <code>model_input</code> 追加最后一个 target，复原 $N+1$ token；
+2. 调教师 <code>compute_logprobs_async(full_sequence)</code>；
+3. 丢掉首 token 的 log-prob，以后 $N$ 个值对齐 targets。
+
+~~~python
+full_sequence = datum.model_input.append_int(last_target)
+teacher_logprobs = await teacher.compute_logprobs_async(full_sequence)
+aligned_teacher_logprobs = teacher_logprobs[1:]
+~~~
+
+证据：[train_on_policy.py L72–96](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L72-L96)。首 token 没有前文可预测，[SamplingClient 文档](https://tinker-docs.thinkingmachines.ai/tinker/api-reference/samplingclient/)也说明其首位置 log-prob 不可用。
+
+<Callout type="info" title="最常见的 off-by-one">
+  忘记追加最后 target，会漏掉最后一个学生 token；忘记切掉教师首位置，则所有 teacher log-prob 都错位一个 token。
+</Callout>
+
+## 第 6 步：把 Reverse KL 写进 advantage
+
+对学生采到的 token：
+
+$$
+\widehat{\mathrm{KL}}_t
+=\log p_{\mathrm{sample}}(a_t\mid s_t)
+-\log q_{\mathrm{teacher}}(a_t\mid s_t).
+$$
+
+~~~python
+reverse_kl = (sampled_logprobs - teacher_logprobs[1:]) * mask
+kl_advantages = -kl_penalty_coef * mask * reverse_kl
+datum.advantages += kl_advantages
+~~~
+
+证据：
+
+- reverse KL：[train_on_policy.py L86–96](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L86-L96)
+- advantage 与 discount：[L101–108](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L101-L108)
+- 分 dataset 记录 KL：[L110–130](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L110-L130)
+
+<code>kl_discount_factor=0</code> 时只用立即 token KL；大于 0 时累计折扣未来 KL。[discounted_future_sum_vectorized L192–211](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/metrics.py#L192-L211)
+
+## 第 7 步：Importance Sampling 更新
+
+<code>train_step()</code> 把 mask 移除，因为 prompt advantage 已为 0，再把 Datum 交给 Tinker：
+
+~~~python
+training_client.forward_backward_async(
+    data,
+    loss_fn="importance_sampling",
+)
+training_client.optim_step_async(
+    AdamParams(learning_rate=lr, beta1=0.9, beta2=0.95, eps=1e-8),
+)
+~~~
+
+源码：[rl/train.py L265–362](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/train.py#L265-L362)。
+
+$$
+\mathcal L_{\mathrm{IS}}
+=-\sum_t
+\exp\left(
+\log p_{\mathrm{learner}}(a_t)
+-\log p_{\mathrm{sample}}(a_t)
+\right)A_t.
+$$
+
+来源：[Tinker Importance Sampling](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/)。
+
+| log-ratio | 用途 |
+|---|---|
+| sample student − teacher | 教师 reverse-KL 监督 |
+| learner − sampler | importance correction |
+
+默认 loss 是 importance sampling，不是 PPO clip；入口允许替换为 PPO，但 README 结果使用默认值。
+
+## 第 8 步：刷新 sampler
+
+训练后代码计算 learner/sampler metrics，保存新权重，创建新 sampling client，下一轮用它 rollout：
+
+- OPD 包装层：[train_on_policy.py L229–279](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L229-L279)
+- 保存并创建 sampler：[rl/train.py L1257–1292](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/train.py#L1257-L1292)
+- full-batch metrics：[rl/train.py L1356–1405](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/train.py#L1356-L1405)
+
+这才是 on-policy 的工程落点：学生更新后持续刷新 rollout policy。
+
+## 忠于源码的一轮伪代码
+
+~~~python
+student_sampler = snapshot(training_client)
+
+for step in range(num_steps):
+    groups = dataset.get_batch(step)
+    trajectories = rollout(
+        student_sampler,
+        groups,
+        temperature=config.temperature,
+        max_tokens=config.max_tokens,
+    )
+
+    data = assemble_training_data(trajectories)
+    teacher_lp = teacher.compute_logprobs(full_sequences)[1:]
+    sampled_lp = data.sampled_logprobs
+
+    data.advantages += -config.kl_penalty_coef * (
+        sampled_lp - teacher_lp
+    )
+
+    if config.kl_discount_factor > 0:
+        data.advantages = discounted_future_sum(data.advantages)
+
+    forward_backward(data, loss_fn=config.loss_fn)
+    optim_step(learning_rate=config.learning_rate)
+    student_sampler = snapshot(training_client)
+~~~
+
+## 超参：代码默认与 README 复现值
+
+| 参数 | 单轮 CLI 默认 | 当前 reasoning README | 怎么读 |
+|---|---:|---:|---|
+| student | Qwen3.5-9B-Base | 同 | 载入 SFT checkpoint |
+| teacher | Qwen3.5-9B | 同 | 固定 SamplingClient |
+| <code>lora_rank</code> | 128 | 128 | LoRA 容量 |
+| <code>group_size</code> | 4 | 4 | rollouts / prompt |
+| <code>groups_per_batch</code> | 1024 | 512 | prompts / update |
+| trajectories / update | 4096 | 2048 | 前两项相乘 |
+| <code>learning_rate</code> | 1e-4 | 1e-4 LoRA | README 称 full FT 5e-5 |
+| <code>max_tokens</code> | 4096 | 16384 | rollout 上限 |
+| prompt 上限 | 1024 | 1024 | builder 默认 |
+| <code>temperature</code> | 底层实际 1.0 | 1.0 | CLI 有接线缺口 |
+| <code>kl_penalty_coef</code> | 1.0 | 1.0 | 唯一监督尺度 |
+| <code>kl_discount_factor</code> | 0.0 | 0.0 | 立即 KL |
+| <code>loss_fn</code> | importance sampling | 同 | 默认无 clipping |
+| <code>num_substeps</code> | 1 | 1 | 切 batch，不是重复 epochs |
+| eval / save | 20 / 20 | 20 / 20 | cadence |
+
+CLI 定义：[on_policy_distillation.py L50–99](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/on_policy_distillation.py#L50-L99)。  
+README 命令与作者结果：[官方 Model Distillation](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/)。
+
+## 版本缺口：单轮 temperature 没传到底层
+
+<Callout type="error" title="当前提交的静默接线问题">
+  单轮 CLI 定义了 <code>temperature: float = 1.0</code>，但创建 <code>train_on_policy.Config</code> 时漏掉 <code>temperature=cli_config.temperature</code>。默认实验不受影响；用户显式改 temperature 时，底层仍使用 Config 默认 1.0。
+</Callout>
+
+证据链：
+
+1. CLI 字段存在：[on_policy_distillation.py L67–82](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/on_policy_distillation.py#L67-L82)
+2. 构造 Config 时漏传：[L153–176](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/on_policy_distillation.py#L153-L176)
+3. 底层默认 1.0：[train_on_policy.py L133–152](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L133-L152)
+4. Harbor 多轮入口正确传参：[Harbor L152–173](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation/on_policy_distillation_harbor_multi_turn.py#L152-L173)
+
+这是版本化源码事实，不是 OPD 算法缺陷。修复后若使用非 1 温度，还要重新核验 sampled log-prob 与目标分布的解释。
+
+## 当前官方命令
+
+### SFT
+
+~~~bash
+python -m tinker_cookbook.recipes.distillation.off_policy_reasoning \
+    model_name=Qwen/Qwen3.5-9B-Base \
+    learning_rate=1e-3 \
+    batch_size=128 \
+    lora_rank=128 \
+    wandb_project=cookbook_distillation
+~~~
+
+### OPD
+
+~~~bash
+python -m tinker_cookbook.recipes.distillation.on_policy_distillation \
+    model_name=Qwen/Qwen3.5-9B-Base \
+    teacher_model=Qwen/Qwen3.5-9B \
+    load_checkpoint_path=tinker://YOUR_SFT_CHECKPOINT \
+    dataset=deepmath \
+    learning_rate=1e-4 \
+    groups_per_batch=512 \
+    lora_rank=128 \
+    max_tokens=16384 \
+    wandb_project=cookbook_distillation
+~~~
+
+命令来自当前 [Tinker Model Distillation recipe](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/)。运行需要 Tinker 服务权限；支持模型会变化，以官方列表为准。
+
+## 三组实验，不能拼成同一条曲线
+
+### GKD 论文：T5 研究设置
+
+**设置**：SFT 后的 T5-XL 教师，T5-small/base/large 学生；XSum、WMT、GSM8K。  
+**问题**：学生数据比例 $\lambda$ 与 forward KL、reverse KL、JSD 的组合。  
+**边界**：论文报告 on-policy 方案整体较强，但最佳 divergence 依任务与学生容量变化；T5/Adafactor 超参不能直接搬到 Qwen/LoRA。  
+来源：[arXiv:2306.13649](https://arxiv.org/abs/2306.13649)。
+
+### 2025 博文：已退役的 Qwen3 设置
+
+**设置**：原 Qwen3-8B-Base 与 Qwen3 系列教师；页面在 2026-06 说明这些 Tinker 模型已退役。  
+**作者报告**：400k off-policy SFT 后约 60% AIME'24；约 150 OPD steps、77k prompts、每 prompt 4 samples 到约 70%。matched RL-teacher 实验报告 7–10 倍更少 gradient steps，并按其设置估算 50–100 倍 compute efficiency。  
+**边界**：旧模型、特定 initialization 和 FLOPs 口径，不是当前 Qwen3.5 命令的结果。  
+来源：[Thinking Machines 博文](https://thinkingmachines.ai/blog/on-policy-distillation/)。
+
+### 当前 Cookbook：Qwen3.5 设置
+
+**设置**：Qwen3.5-9B-Base 学生，Qwen3.5-9B 教师。  
+**作者报告**：rank-128 LoRA 在 OpenThoughts3 SFT 3000 steps 后约 65% AIME'24；从该 checkpoint 在 DeepMath 做 200 OPD steps、16k-token rollouts 后约 76.7%。  
+**评估**：temperature 1.0、top-p 1.0、top-k -1、max tokens 64000。  
+**边界**：README/官方文档的作者观察，不是本站独立复现。  
+来源：[当前官方 recipe](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/)。
+
+<Callout type="warn" title="不要做错误横比">
+  三组结果使用不同模型、数据、初始化、上下文与评估。它们能共同支持机制研究，但不能把百分比直接拼到同一张“算法进步”图上。
+</Callout>
+
+## 监控与调试
+
+至少同时记录：
+
+- held-out task metric；
+- <code>teacher_kl</code>；
+- learner–sampler KL 与 importance-ratio 长尾；
+- rollout length、stop reason、截断率；
+- prompts、trajectories、generated tokens；
+- teacher forward 与 student training 计算量。
+
+<Callout type="info" title="teacher_kl 偶尔为负不一定是 bug">
+  真 KL 非负，但源码记录的是有限学生样本上的平均 log-ratio。单 token log-ratio 和有限 batch 均值都可能暂时为负。应看趋势，并检查 mask、token 对齐与采样设置。
+</Callout>
+
+### teacher KL 不降
+
+- teacher/student tokenizer 是否兼容？
+- teacher log-prob 是否正确切掉首位置？
+- action mask 是否为 1、prompt mask 是否为 0？
+- SFT 初始化是否离教师过远？
+- <code>kl_penalty_coef</code> 是否为 0？
+- 学习率是否过小？
+
+### KL 降了，任务指标不升
+
+- 是否只在很窄的 prompts 上过拟合？
+- rollout 温度是否太低？
+- 教师本身是否在目标 benchmark 上强？
+- completion 是否大量截断？
+- training 与 evaluation decoding 是否一致？
+
+### 训练不稳定
+
+- 检查 importance ratio 和 learner–sampler KL；
+- 降低学习率；
+- 减少 substeps；
+- 增大 batch 或 group size；
+- 对照 importance sampling 与 PPO clip，不要预设 clip 必然更好。
+
+## 自测
+
+1. 为什么环境 reward 为 0 仍能训练？
+2. 为什么教师 log-prob 要切掉第一个位置？
+3. <code>load_checkpoint_path</code> 与 <code>teacher_checkpoint</code> 分别加载谁？
+4. learner/sampler ratio 与 student/teacher log-ratio 有何不同？
+5. 当前单轮 temperature 为什么会被忽略？
+
+<details>
+<summary>查看答案</summary>
+
+1. 教师 reverse-KL 被逐 token 加进 advantage，成为唯一监督。
+2. 首 token 没有前文可预测；切掉它后才与 next-token targets 对齐。
+3. 前者初始化学生，后者可选地加载教师权重。
+4. 前者做 importance correction；后者提供教师监督。
+5. CLI 有字段，但当前提交创建底层 Config 时没有传入，底层回落到 1.0。
+
+</details>
+
+## 一手资料
+
+- [Tinker Cookbook distillation 目录](https://github.com/thinking-machines-lab/tinker-cookbook/tree/main/tinker_cookbook/recipes/distillation)
+- [本章固定提交](https://github.com/thinking-machines-lab/tinker-cookbook/tree/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/recipes/distillation)
+- [Tinker 官方 Model Distillation](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/)
+- [Tinker 官方 Importance Sampling](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/)
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [GKD / On-Policy Distillation of Language Models](https://arxiv.org/abs/2306.13649)
+- [PPO 原论文](https://arxiv.org/abs/1707.06347)

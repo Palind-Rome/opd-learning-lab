@@ -1,0 +1,432 @@
+---
+title: 最小 OPD 训练循环
+description: 框架无关地走完 prompt、学生 rollout、教师打分、Reverse-KL advantage、Importance Sampling 与权重刷新。
+---
+
+<Callout type="info" title="本章实现哪一种 OPD？">
+  下面实现的是 Thinking Machines / Tinker 风格的 sampled-token Reverse-KL OPD：学生生成、教师只给已采 token 打分、用 policy-gradient advantage 更新。Full-vocabulary GKD 或 top-k OPD 的张量和梯度路径不同。
+</Callout>
+
+<OPDCycle />
+
+先点击上面的五个交接点形成整体印象，再往下追每个 tensor 的来源。
+
+## 约定 Shape
+
+令：
+
+- $B$：每个 step 的 prompt 数；
+- $G$：每个 prompt 的 rollout 数；
+- $D=B\times G$：展开后的 trajectory 数；
+- $L_p$：padding 后 prompt 长度；
+- $L_r$：padding 后 response 长度；
+- $V$：词表大小。
+
+工程中通常先保留 $[B,G,\ldots]$ 方便按 prompt 统计，再展平为 $[D,\ldots]$ 送进 teacher/student forward。
+
+## Tensor 总账
+
+| Tensor | Shape | 谁产生 | 是否参与梯度 | 去哪里 |
+|---|---:|---|---:|---|
+| <code>prompt_ids</code> | $[B,L_p]$ | dataset | 否 | student rollout、teacher/student scoring |
+| <code>prompt_mask</code> | $[B,L_p]$ | tokenizer/collator | 否 | attention mask |
+| <code>response_ids</code> | $[B,G,L_r]$ | student sampler | 否 | teacher/student 共同 teacher-force |
+| <code>response_mask</code> | $[B,G,L_r]$ | rollout/collator | 否 | 排除 padding，只训练学生 response |
+| <code>sampling_logprobs</code> | $[B,G,L_r]$ | rollout sampler | 否，必须 detach | Reverse-KL 样本与 importance denominator |
+| <code>teacher_logprobs</code> | $[B,G,L_r]$ | 固定 teacher | 否 | teacher log-ratio |
+| <code>learner_logprobs</code> | $[D,L_r]$ | 当前可训练 student | **是** | importance numerator 与反向传播 |
+| <code>token_log_ratio</code> | $[D,L_r]$ | sample − teacher | 否 | 构造 advantage 与监控 |
+| <code>advantages</code> | $[D,L_r]$ | $-\beta$ × log-ratio | 否 | policy loss |
+| <code>importance_ratio</code> | $[D,L_r]$ | learner / sampler | **是** | policy loss |
+| <code>loss</code> | scalar | masked reduction | **是** | backward / optimizer |
+
+<Callout type="warn" title="两个 student 视图">
+  sampler 是 rollout 时学生权重的快照；learner 是执行 forward/backward 的当前学生。同步单步训练时二者很接近，但仍要保留 sampling log-prob，才能诊断或修正服务数值差异、子批更新和异步 staleness。
+</Callout>
+
+## 第 0 步：只取 Prompt
+
+一个基础 OPD batch 不需要数据集里的标准 response：
+
+~~~python
+batch = next(prompt_loader)
+prompt_ids = batch["input_ids"]          # [B, Lp]
+prompt_mask = batch["attention_mask"]    # [B, Lp]
+~~~
+
+若数据集同时含 response，要明确丢掉它，避免“名为 on-policy，实际仍训练固定答案”。
+
+Tinker 的 <code>PromptOnlyDatasetBuilder</code> 正是这一职责：[datasets.py L221–276](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/datasets.py#L221-L276)。
+
+## 第 1 步：从当前学生保存 Sampler
+
+~~~python
+sampler = snapshot_for_generation(student)
+~~~
+
+每个 optimizer step 或小组 steps 后要定义清楚 sampler 刷新频率。最严格的同步版本每步刷新：
+
+~~~text
+student θ_k → sampler θ_k → rollout → update → student θ_{k+1}
+student θ_{k+1} → sampler θ_{k+1} → ...
+~~~
+
+如果 sampler 很久不刷新，数据会逐步变成 stale / off-policy。此时 learner/sampler ratio 与 KL 必须成为一等监控指标。
+
+Tinker 的同步循环在开始时获取 sampling client，并在每次更新后返回新 client：[train_on_policy.py L299–357](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L299-L357)。
+
+## 第 2 步：学生 Rollout
+
+~~~python
+with no_grad():
+    response_ids, response_mask, sampling_logprobs = sampler.generate(
+        prompt_ids=repeat_interleave(prompt_ids, G),
+        prompt_mask=repeat_interleave(prompt_mask, G),
+        max_new_tokens=max_response_tokens,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=None,
+        return_logprobs=True,
+    )
+~~~
+
+输出展平前通常是：
+
+~~~text
+response_ids        [B, G, Lr]
+response_mask       [B, G, Lr]
+sampling_logprobs   [B, G, Lr]
+~~~
+
+### 必须保存真实 Sampling Log-prob
+
+不要在 rollout 后用另一个配置“猜” sampling log-prob。温度、top-p、top-k、服务端数值路径都会改变实际采样分布。
+
+基础推导最清楚的设置是：
+
+~~~text
+temperature = 1.0
+top_p = 1.0
+no top-k truncation
+~~~
+
+GKD 的训练采样使用温度 1；Tinker 当前 recipe 与 README 复现也使用 1。[GKD §3.1](https://arxiv.org/pdf/2306.13649)；[Tinker recipe](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/)。
+
+## 第 3 步：构造同一条 Teacher-forced 序列
+
+教师和 learner 必须看到**完全相同**的 prompt + 学生 response：
+
+~~~python
+D = B * G
+flat_prompt_ids = repeat_interleave(prompt_ids, G)       # [D, Lp]
+flat_prompt_mask = repeat_interleave(prompt_mask, G)
+flat_response_ids = flatten_BG(response_ids)             # [D, Lr]
+flat_response_mask = flatten_BG(response_mask).float()
+
+full_ids = concat_valid_tokens(
+    flat_prompt_ids,
+    flat_response_ids,
+)
+~~~
+
+### Next-token Shift
+
+自回归 scoring 要对齐：
+
+~~~text
+full tokens:  [x0, x1, x2, y0, y1, y2]
+model input:  [x0, x1, x2, y0, y1]
+targets:      [x1, x2, y0, y1, y2]
+loss mask:    [ 0,  0,  1,  1,  1]
+~~~
+
+loss mask 中第一个 1 对应“看完 prompt 后预测第一个 response token”。padding、prompt 和环境 observation 必须为 0。
+
+Tinker 在 <code>trajectory_to_data()</code> 中 right-shift input、left-shift targets，并让 observation mask 为 0、action mask 为 1：[data_processing.py L138–185](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/rl/data_processing.py#L138-L185)。
+
+<Callout type="error" title="最危险的静默错误">
+  teacher、sampler 与 learner 即使 shape 都是 $[D,L_r]$，也可能错位一个 token。训练仍会运行、loss 也会变化，却是在拿“当前 token 的学生概率”对比“上一个或下一个 token 的教师概率”。先用 5–10 token 玩具序列逐位置打印核验。
+</Callout>
+
+## 第 4 步：固定教师打分
+
+~~~python
+with no_grad():
+    model_input_ids = full_ids[:, :-1]
+    shifted_targets = full_ids[:, 1:]
+    teacher_logits = teacher(model_input_ids)            # [D, L-1, V]
+    teacher_logprobs_all = log_softmax(teacher_logits)
+    teacher_logprobs = gather_response_targets(
+        teacher_logprobs_all,
+        target_ids=shifted_targets,
+        response_positions=response_positions,
+    )                                                    # [D, Lr]
+~~~
+
+教师要满足：
+
+- <code>eval()</code> 模式；
+- 不创建梯度；
+- tokenizer、special tokens、chat template 与学生序列兼容；
+- 使用学生真正生成的 response，而不是自己重写。
+
+Tinker 为复原完整未 shift 序列，会给 <code>model_input</code> 追加最后 target；教师返回的首 token 没有前文可预测，所以切 <code>[1:]</code> 对齐 $N$ 个 targets：[train_on_policy.py L72–96](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py#L72-L96)。
+
+## 第 5 步：构造 Sampled-token Reverse-KL 信号
+
+~~~python
+sample_lp = flatten_BG(sampling_logprobs).detach()       # [D, Lr]
+teacher_lp = teacher_logprobs.detach()                   # [D, Lr]
+mask = flat_response_mask                                # [D, Lr]
+
+token_log_ratio = (sample_lp - teacher_lp) * mask
+advantages = (-kl_coef * token_log_ratio) * mask
+~~~
+
+数学上：
+
+$$
+\ell_t
+=\log p_{\mathrm{sample}}(\hat y_t\mid s_t)
+-\log q_{\mathrm{teacher}}(\hat y_t\mid s_t),
+$$
+
+$$
+A_t=-\beta\ell_t.
+$$
+
+当 $\hat y_t\sim p$ 且分布定义一致时，$\ell_t$ 是固定前缀 token-level reverse KL 的单样本无偏估计。[Rethinking OPD §2.2](https://arxiv.org/pdf/2604.13016)
+
+### 为什么 Advantage 要 Detach
+
+采样 token 和 sampling log-prob 是 rollout 数据。policy-gradient 通过 learner log-prob / importance ratio 传梯度，不应再穿过 advantage 反向传播。
+
+如果把 <code>sample_lp</code> 换成带梯度的 learner log-prob，再直接对采样的 <code>log p - log q</code> 求导，会把“采样分布如何随参数改变”的 score-function 项处理错。Full-vocabulary KL 可以直接微分，但那是另一种 estimator。
+
+## 第 6 步：可选的未来 KL Credit
+
+基础版本只用立即 token KL。若要让早期 token 为以后 divergence 负责：
+
+$$
+\tilde A_t
+=\sum_{k\ge 0}\gamma^k A_{t+k}.
+$$
+
+~~~python
+if kl_discount_factor > 0:
+    advantages = discounted_future_sum(
+        advantages,
+        gamma=kl_discount_factor,
+        mask=mask,
+    )
+~~~
+
+Tinker 默认 0；作者报告正折扣在其设置中没有明显改善。[Tinker recipe](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/)。
+
+## 第 7 步：Learner Scoring 与 Importance Ratio
+
+~~~python
+learner_logits = student(model_input_ids)                # [D, L-1, V], requires grad
+learner_logprobs = gather_response_targets(
+    log_softmax(learner_logits),
+    shifted_targets,
+    response_positions,
+)                                                        # [D, Lr]
+
+importance_ratio = exp(
+    learner_logprobs - sample_lp
+)                                                        # [D, Lr]
+~~~
+
+这里：
+
+- learner log-prob 是 numerator，保留梯度；
+- sampling log-prob 是 denominator，必须 detach；
+- 同步第一小步时 ratio 通常接近 1；
+- substeps、多 epoch 或异步训练会让 ratio 偏离。
+
+## 第 8 步：Masked Policy Loss
+
+~~~python
+token_loss = -(importance_ratio * advantages.detach())
+valid_token_count = mask.sum().clamp_min(1)
+loss = (token_loss * mask).sum() / valid_token_count
+
+optimizer.zero_grad()
+loss.backward()
+clip_grad_norm_if_configured(student)
+optimizer.step()
+~~~
+
+对应目标：
+
+$$
+\mathcal L
+=-\frac{1}{\sum m_t}
+\sum_t m_t
+\frac{p_{\mathrm{learner}}(\hat y_t\mid s_t)}
+{p_{\mathrm{sample}}(\hat y_t\mid s_t)}
+A_t.
+$$
+
+### Sum 还是 Mean？
+
+上面的框架无关伪代码使用 token mean，便于不同 response length 间保持大致尺度一致。Tinker 官方 built-in RL losses对 token loss 做 sum；不同 reduction 都可以，但会改变有效学习率和长度偏好。必须：
+
+1. 在配置中写清楚；
+2. 同时记录 loss sum、valid tokens 与 token mean；
+3. 比较实验时保持一致。
+
+来源：[Tinker Loss Functions](https://tinker-docs.thinkingmachines.ai/tinker/losses/)。
+
+## 完整最小伪代码
+
+~~~python
+for prompt_batch in prompt_loader:
+    # 1) On-policy rollout
+    sampler = snapshot_for_generation(student)
+    with no_grad():
+        response_ids, response_mask, sample_lp = sampler.generate(
+            prompt_batch,
+            num_rollouts=G,
+            temperature=1.0,
+            return_logprobs=True,
+        )
+
+    # 2) Same student-generated sequence for both models
+    full_ids, targets, response_positions = build_shifted_batch(
+        prompt_batch,
+        response_ids,
+    )
+    mask = response_mask.float()
+
+    # 3) Frozen teacher scoring
+    with no_grad():
+        teacher_lp = score_targets(
+            teacher,
+            full_ids,
+            targets,
+            response_positions,
+        )
+
+    # 4) Detached sampled-token Reverse-KL advantage
+    sample_lp = sample_lp.detach()
+    token_log_ratio = (sample_lp - teacher_lp.detach()) * mask
+    advantage = (-kl_coef * token_log_ratio).detach()
+
+    # 5) Current learner scoring
+    learner_lp = score_targets(
+        student,
+        full_ids,
+        targets,
+        response_positions,
+    )
+
+    # 6) IS correction and masked update
+    rho = exp(learner_lp - sample_lp)
+    token_loss = -(rho * advantage)
+    loss = (token_loss * mask).sum() / mask.sum().clamp_min(1)
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    # 7) Log before discarding tensors
+    log_metrics(
+        loss=loss,
+        teacher_log_ratio=token_log_ratio,
+        learner_sampler_log_ratio=learner_lp.detach() - sample_lp,
+        response_mask=mask,
+        response_lengths=mask.sum(-1),
+    )
+~~~
+
+## 训练前必须通过的 Assertions
+
+~~~python
+assert response_ids.shape == response_mask.shape
+assert sample_lp.shape == teacher_lp.shape == learner_lp.shape
+assert sample_lp.shape == response_mask.shape
+assert response_mask.sum() > 0
+assert isfinite(sample_lp[response_mask.bool()]).all()
+assert isfinite(teacher_lp[response_mask.bool()]).all()
+assert isfinite(learner_lp[response_mask.bool()]).all()
+assert not teacher.training
+assert not sample_lp.requires_grad
+assert not teacher_lp.requires_grad
+assert learner_lp.requires_grad
+~~~
+
+还应人工做一次：
+
+1. 打印 prompt 和 response 文本；
+2. 打印每个 response token；
+3. 对每个 token 打印 sample / teacher / learner log-prob；
+4. 确认第一个 response token 的上下文是完整 prompt；
+5. 确认 padding 与 prompt 的 loss mask 都是 0。
+
+## 分布式实现的三个额外风险
+
+### Sampler Staleness
+
+rollout worker 与 learner 异步时，记录每条轨迹的 policy version。不要只记全局 step，否则无法知道一条 response 来自多旧的 sampler。
+
+### Teacher 与 Student 的并行切分
+
+teacher scoring 通常只有 forward，可独立批处理；但必须保留 trajectory 索引，all-gather 后不能打乱 <code>response_ids</code>、<code>sample_lp</code> 与 <code>teacher_lp</code> 对应关系。
+
+### Variable Length Reduction
+
+按 token mean、sequence mean、prompt mean 会产生不同权重：
+
+- token mean：长回答贡献更多 token，但整体按 token 平均；
+- sequence mean：每条回答权重相同；
+- prompt mean：每个 prompt 权重相同，再平均 $G$ 条 rollout。
+
+记录分子、分母和分层样本数，才能复现实验。
+
+## 和 Tinker 实现对照
+
+| 框架无关步骤 | Tinker 函数 |
+|---|---|
+| rollout | <code>do_group_rollout_and_filter_constant_reward()</code> |
+| trajectory → Datum | <code>assemble_training_data()</code> |
+| teacher scoring / KL | <code>incorporate_kl_penalty()</code> |
+| 训练调用 | <code>train_step()</code> |
+| sampler 刷新 | <code>compute_full_batch_metrics_and_get_sampling_client()</code> |
+
+完整源码导读见 [Tinker Cookbook 源码导读](/docs/engineering/tinker-cookbook)。
+
+<Cards>
+  <Card title="下一步：指标仪表盘" href="/docs/practice/metrics">
+    loss 能下降并不代表 OPD 成功；学习如何联动看 KL、entropy、长度与 overlap。
+  </Card>
+  <Card title="回看 KL 估计器" href="/docs/foundations/kl-divergence">
+    理解 sampled-token、top-k 与 full-vocabulary 的差别。
+  </Card>
+</Cards>
+
+## 自测
+
+1. sampling log-prob 和 learner log-prob 为什么不能只留一个？
+2. teacher scoring 为什么必须使用学生 response？
+3. advantage 为什么要 detach？
+4. token-mean 与 sum reduction 为什么会影响长回答实验？
+
+<details>
+<summary>查看答案</summary>
+
+1. 前者定义 rollout 分布和 importance denominator；后者是带梯度的当前 learner numerator。
+2. 否则监督不在学生访问的前缀上，就不再是这一定义下的 on-policy distillation。
+3. policy-gradient 应通过 learner probability 传梯度，teacher 与 rollout reward 是固定训练信号。
+4. sum 会让有效梯度规模随有效 token 数增长；mean 会除去该尺度。换 reduction 等同于改变有效步幅和样本权重。
+
+</details>
+
+## 一手资料
+
+- [Thinking Machines Lab — On-Policy Distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+- [Tinker — Importance Sampling](https://tinker-docs.thinkingmachines.ai/tinker/losses/importance-sampling/)
+- [Tinker Cookbook — train_on_policy.py](https://github.com/thinking-machines-lab/tinker-cookbook/blob/b939b4f3c14502e84c60e05e560ef93b9da31baf/tinker_cookbook/distillation/train_on_policy.py)
+- [GKD / On-Policy Distillation of Language Models](https://arxiv.org/abs/2306.13649)
+- [Rethinking OPD：三种监督粒度](https://arxiv.org/abs/2604.13016)
